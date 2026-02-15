@@ -1,19 +1,36 @@
-"""智能检测缺失交易日并用BaoStock补齐数据"""
+"""智能检测缺失交易日并用BaoStock补齐数据（多进程并发版）"""
 
 import sys
+import os
+import io
 import datetime
 import time
+import tempfile
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 import pandas as pd
 import baostock as bs
-from tqdm import tqdm
 from 配置 import (
     原始CSV目录, 合并数据路径, 输出列名,
-    BAOSTOCK_FIELDS, 复权方式, 频率, 同步更新CSV,
+    BAOSTOCK_FIELDS, 复权方式, 频率, 同步更新CSV, 日线并发进程数,
 )
 
-# BaoStock互斥锁文件
-BAOSTOCK_LOCK = Path(r"C:\Users\Administrator\AppData\Local\Temp\baostock.lock")
+# BaoStock互斥锁文件（跨平台）
+BAOSTOCK_LOCK = Path(tempfile.gettempdir()) / "baostock.lock"
+# 并发进程数
+并发数 = 日线并发进程数
+# 每个子进程单次处理的股票数（登录一次，批量拉取）
+日线批任务大小 = 80
+# 单只股票重试配置
+日线最大重试次数 = 3
+日线重试基础间隔 = 1
+
+
+def _有效股票代码(series: pd.Series) -> pd.Series:
+    """有效A股代码：6位数字。"""
+    s = series.fillna("").astype(str).str.strip()
+    return s.str.fullmatch(r"\d{6}", na=False)
 
 
 def 代码转BaoStock格式(stock_code: str) -> str:
@@ -60,12 +77,142 @@ def 查询BaoStock数据(bs代码: str, 开始日期: str, 结束日期: str) ->
     return df
 
 
+def _worker_download_daily_batch(tasks: list[dict]) -> list[dict]:
+    """子进程批量下载日线数据：单次登录，循环处理多只股票。"""
+    import baostock as bs
+
+    # 抑制BaoStock stdout/stderr 噪音
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(2)
+        os.dup2(devnull_fd, 2)
+    except Exception:
+        devnull_fd = None
+        old_stderr = None
+
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        lg = bs.login()
+    finally:
+        sys.stdout = old_stdout
+
+    if lg.error_code != "0":
+        if devnull_fd is not None:
+            try:
+                os.dup2(old_stderr, 2)
+                os.close(old_stderr)
+                os.close(devnull_fd)
+            except Exception:
+                pass
+        return [
+            {
+                "ok": False,
+                "stock_code": t["stock_code"],
+                "stock_name": t["stock_name"],
+                "last_date": t["last_date"],
+                "error": "login failed",
+            }
+            for t in tasks
+        ]
+
+    results = []
+    for task in tasks:
+        代码 = task["stock_code"]
+        名称 = task["stock_name"]
+        最后日期 = task["last_date"]
+        开始 = task["start_date"]
+        结束 = task["end_date"]
+        bs代码 = 代码转BaoStock格式(代码)
+
+        rows = []
+        fields = None
+        error_msg = None
+        for 尝试 in range(日线最大重试次数):
+            try:
+                rs = bs.query_history_k_data_plus(
+                    code=bs代码,
+                    fields=BAOSTOCK_FIELDS,
+                    start_date=开始,
+                    end_date=结束,
+                    frequency=频率,
+                    adjustflag=复权方式,
+                )
+                if rs.error_code != "0":
+                    error_msg = rs.error_msg
+                    if 尝试 < 日线最大重试次数 - 1:
+                        if "未登录" in str(error_msg):
+                            old_stdout_retry = sys.stdout
+                            sys.stdout = io.StringIO()
+                            try:
+                                try:
+                                    bs.logout()
+                                except Exception:
+                                    pass
+                                bs.login()
+                            finally:
+                                sys.stdout = old_stdout_retry
+                        time.sleep(日线重试基础间隔 * (2 ** 尝试))
+                        continue
+                    break
+
+                fields = rs.fields
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                break
+            except Exception as e:
+                error_msg = str(e)
+                if 尝试 < 日线最大重试次数 - 1:
+                    time.sleep(日线重试基础间隔 * (2 ** 尝试))
+
+        if not rows:
+            results.append(
+                {
+                    "ok": False,
+                    "stock_code": 代码,
+                    "stock_name": 名称,
+                    "last_date": 最后日期,
+                    "error": error_msg or "no data",
+                }
+            )
+        else:
+            results.append(
+                {
+                    "ok": True,
+                    "stock_code": 代码,
+                    "stock_name": 名称,
+                    "last_date": 最后日期,
+                    "fields": fields,
+                    "rows": rows,
+                }
+            )
+
+    old_stdout2 = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        bs.logout()
+    except Exception:
+        pass
+    finally:
+        sys.stdout = old_stdout2
+
+    if devnull_fd is not None:
+        try:
+            os.dup2(old_stderr, 2)
+            os.close(old_stderr)
+            os.close(devnull_fd)
+        except Exception:
+            pass
+
+    return results
+
+
 def BaoStock数据转标准格式(df: pd.DataFrame, stock_code: str, stock_name: str) -> pd.DataFrame:
     """将BaoStock返回的数据转换为项目标准格式"""
-    结果 = pd.DataFrame()
+    结果 = pd.DataFrame(index=df.index)
+    结果["date"] = df["date"]
     结果["stock_code"] = stock_code
     结果["stock_name"] = stock_name
-    结果["date"] = df["date"]
     结果["open"] = pd.to_numeric(df["open"], errors="coerce")
     结果["high"] = pd.to_numeric(df["high"], errors="coerce")
     结果["low"] = pd.to_numeric(df["low"], errors="coerce")
@@ -77,13 +224,10 @@ def BaoStock数据转标准格式(df: pd.DataFrame, stock_code: str, stock_name:
     turn = pd.to_numeric(df["turn"], errors="coerce")
     结果["turnover"] = turn
 
-    # 流通股本 = 成交量 / 换手率 * 100（换手率是百分比）
-    结果["outstanding_share"] = 结果.apply(
-        lambda r: r["volume"] / r["turnover"] * 100
-        if pd.notna(r["turnover"]) and r["turnover"] > 0
-        else 0,
-        axis=1,
-    )
+    # 流通股本 = 成交量 / 换手率 * 100（向量化，明显快于逐行apply）
+    结果["outstanding_share"] = 0.0
+    有效 = turn.notna() & (turn > 0)
+    结果.loc[有效, "outstanding_share"] = 结果.loc[有效, "volume"] / turn[有效] * 100
 
     return 结果[输出列名]
 
@@ -158,135 +302,183 @@ def 智能更新():
         return
 
     创建BaoStock锁()
+    try:
+        # 1. 读取现有数据
+        print("\n[1/4] 读取现有数据...")
+        现有数据 = 安全读取Parquet()
+        print(f"  现有数据: {len(现有数据):,} 行, {现有数据['stock_code'].nunique()} 只股票")
 
-    # 1. 读取现有数据
-    print("\n[1/4] 读取现有数据...")
-    现有数据 = 安全读取Parquet()
-    print(f"  现有数据: {len(现有数据):,} 行, {现有数据['stock_code'].nunique()} 只股票")
+        # 清理历史坏数据：stock_code 为空/非法的行不参与后续计算，也不会再写回
+        有效行掩码 = _有效股票代码(现有数据["stock_code"])
+        无效行数 = int((~有效行掩码).sum())
+        if 无效行数 > 0:
+            print(f"  [修复] 发现无效stock_code行: {无效行数}，已在本次更新中剔除")
+            现有数据 = 现有数据.loc[有效行掩码].copy()
 
-    # 2. 分析每只股票的最新日期
-    print("\n[2/4] 分析各股票数据情况...")
-    股票最新日期 = 现有数据.groupby(["stock_code", "stock_name"])["date"].max().reset_index()
-    股票最新日期.columns = ["stock_code", "stock_name", "last_date"]
+        # 2. 分析每只股票的最新日期
+        print("\n[2/4] 分析各股票数据情况...")
+        股票最新日期 = 现有数据.groupby(["stock_code", "stock_name"])["date"].max().reset_index()
+        股票最新日期.columns = ["stock_code", "stock_name", "last_date"]
 
-    # 3. 登录BaoStock并获取交易日历
-    print("\n[3/4] 连接BaoStock...")
-    lg = bs.login()
-    if lg.error_code != "0":
-        print(f"  BaoStock登录失败: {lg.error_msg}")
-        return
-    print("  BaoStock登录成功")
+        # 3. 登录BaoStock并获取交易日历
+        print("\n[3/4] 连接BaoStock...")
+        lg = bs.login()
+        if lg.error_code != "0":
+            print(f"  BaoStock登录失败: {lg.error_msg}")
+            return
+        print("  BaoStock登录成功")
 
-    # 获取交易日历：从最早的last_date到今天
-    今天 = datetime.date.today().strftime("%Y-%m-%d")
-    最早日期 = 股票最新日期["last_date"].min()
-    全部交易日 = 获取交易日历(最早日期, 今天)
-    print(f"  交易日历范围: {最早日期} ~ {今天}, 共 {len(全部交易日)} 个交易日")
-
-    # 预筛选：找出真正缺失交易日的股票
-    # 获取最近一个交易日（排除今天，因为今天可能还未收盘）
-    全部交易日列表 = sorted(全部交易日)
-    最近交易日 = 全部交易日列表[-1] if 全部交易日列表[-1] != 今天 else (全部交易日列表[-2] if len(全部交易日列表) > 1 else 今天)
-
-    需要更新的股票 = 股票最新日期[股票最新日期["last_date"] < 最近交易日].copy()
-    print(f"  最近交易日: {最近交易日}")
-    print(f"  需要更新: {len(需要更新的股票)} 只（已是最新: {len(股票最新日期) - len(需要更新的股票)} 只）")
-
-    if len(需要更新的股票) == 0:
-        print("\n所有股票数据都已是最新！")
+        # 获取交易日历：从最早的last_date到今天
+        今天 = datetime.date.today().strftime("%Y-%m-%d")
+        最早日期 = 股票最新日期["last_date"].min()
+        全部交易日 = 获取交易日历(最早日期, 今天)
+        print(f"  交易日历范围: {最早日期} ~ {今天}, 共 {len(全部交易日)} 个交易日")
         bs.logout()
-        return
 
-    # 4. 逐只股票检查并更新
-    print(f"\n[4/4] 开始更新...")
-    更新股票数 = 0
-    新增行数 = 0
-    跳过数 = 0
-    失败列表 = []
-    所有新数据 = []
-    CSV批量更新 = {}  # 批量累积CSV更新，最后统一写入
+        # 预筛选：找出真正缺失交易日的股票
+        # 获取最近一个交易日（排除今天，因为今天可能还未收盘）
+        全部交易日列表 = sorted(全部交易日)
+        最近交易日 = 全部交易日列表[-1] if 全部交易日列表[-1] != 今天 else (全部交易日列表[-2] if len(全部交易日列表) > 1 else 今天)
 
-    for _, row in tqdm(需要更新的股票.iterrows(), total=len(需要更新的股票), desc="更新进度"):
-        代码 = row["stock_code"]
-        名称 = row["stock_name"]
-        最后日期 = row["last_date"]
+        # 二次保险：只允许合法6位股票代码参与更新任务
+        股票最新日期 = 股票最新日期[_有效股票代码(股票最新日期["stock_code"])].copy()
+        需要更新的股票 = 股票最新日期[股票最新日期["last_date"] < 最近交易日].copy()
+        print(f"  最近交易日: {最近交易日}")
+        print(f"  需要更新: {len(需要更新的股票)} 只（已是最新: {len(股票最新日期) - len(需要更新的股票)} 只）")
 
-        # 计算缺失的交易日（不包括今天，避免盘中数据不完整）
-        缺失交易日 = {d for d in 全部交易日 if 最后日期 < d <= 最近交易日}
+        if len(需要更新的股票) == 0:
+            print("\n所有股票数据都已是最新！")
+            return
 
-        if not 缺失交易日:
-            跳过数 += 1
-            continue
+        # 4. 并发下载并更新
+        print(f"\n[4/4] 开始并发更新（{并发数} 进程）...")
+        更新股票数 = 0
+        新增行数 = 0
+        跳过数 = 0
+        失败列表 = []
+        所有新数据 = []
+        CSV批量更新 = {}  # 批量累积CSV更新，最后统一写入
 
-        # 确定查询区间（到最近交易日，不查今天）
-        开始 = min(缺失交易日)
-        结束 = 最近交易日
-        bs代码 = 代码转BaoStock格式(代码)
+        任务列表 = []
+        for _, row in 需要更新的股票.iterrows():
+            任务列表.append({
+                "stock_code": row["stock_code"],
+                "stock_name": row["stock_name"],
+                "last_date": row["last_date"],
+                # 直接从last_date重拉，后续按date去重/过滤，避免逐股构造缺失日集合
+                "start_date": row["last_date"],
+                "end_date": 最近交易日,
+            })
 
-        try:
-            新数据 = 查询BaoStock数据(bs代码, 开始, 结束)
-            if 新数据 is None or 新数据.empty:
-                跳过数 += 1
-                continue
+        # 可选：环境变量控制测试任务数（仅调试用）
+        调试最大任务数 = os.getenv("DAILY_MAX_TASKS")
+        if 调试最大任务数:
+            try:
+                n = max(1, int(调试最大任务数))
+                任务列表 = 任务列表[:n]
+                print(f"  [调试] 仅执行前 {n} 个任务")
+            except Exception:
+                pass
 
-            标准数据 = BaoStock数据转标准格式(新数据, 代码, 名称)
+        总任务数 = len(任务列表)
+        print(f"  并发任务: {总任务数}")
 
-            # 过滤掉已存在的日期
-            标准数据 = 标准数据[标准数据["date"] > 最后日期]
-            if 标准数据.empty:
-                跳过数 += 1
-                continue
+        已完成 = 0
+        批任务列表 = [任务列表[i:i + 日线批任务大小] for i in range(0, len(任务列表), 日线批任务大小)]
 
-            所有新数据.append(标准数据)
+        with ProcessPoolExecutor(max_workers=并发数) as executor:
+            future_to_batch = {executor.submit(_worker_download_daily_batch, b): b for b in 批任务列表}
+            for future in as_completed(future_to_batch):
+                批次任务 = future_to_batch[future]
+                try:
+                    批次结果 = future.result()
+                except Exception as e:
+                    for t in 批次任务:
+                        已完成 += 1
+                        失败列表.append((t["stock_code"], t["stock_name"], f"batch error: {e}"))
+                        if 已完成 % 50 == 0 or 已完成 == 总任务数:
+                            print(f"  进度: {已完成}/{总任务数}")
+                    continue
 
-            # 累积CSV更新（稍后批量写入）
-            if 同步更新CSV:
-                if 代码 not in CSV批量更新:
-                    CSV批量更新[代码] = {"名称": 名称, "数据": []}
-                CSV批量更新[代码]["数据"].append(标准数据)
+                for result in 批次结果:
+                    已完成 += 1
+                    代码 = result["stock_code"]
+                    名称 = result["stock_name"]
+                    最后日期 = result["last_date"]
 
-            更新股票数 += 1
-            新增行数 += len(标准数据)
+                    try:
+                        if not result.get("ok"):
+                            跳过数 += 1
+                            if result.get("error") and result.get("error") != "no data":
+                                失败列表.append((代码, 名称, result.get("error")))
+                            if 已完成 % 50 == 0 or 已完成 == 总任务数:
+                                print(f"  进度: {已完成}/{总任务数}")
+                            continue
 
-        except Exception as e:
-            失败列表.append((代码, 名称, str(e)))
+                        原始df = pd.DataFrame(result["rows"], columns=result["fields"])
+                        标准数据 = BaoStock数据转标准格式(原始df, 代码, 名称)
 
-    bs.logout()
+                        # 过滤掉已存在日期
+                        标准数据 = 标准数据[标准数据["date"] > 最后日期]
+                        标准数据 = 标准数据[_有效股票代码(标准数据["stock_code"])]
+                        if 标准数据.empty:
+                            跳过数 += 1
+                        else:
+                            所有新数据.append(标准数据)
+                            更新股票数 += 1
+                            新增行数 += len(标准数据)
 
-    # 批量写入CSV（减少磁盘IO）- 可选
-    if 同步更新CSV and CSV批量更新:
-        print(f"\n正在更新 {len(CSV批量更新)} 个CSV文件...")
-        for 代码, 信息 in CSV批量更新.items():
-            名称 = 信息["名称"]
-            合并数据 = pd.concat(信息["数据"], ignore_index=True)
-            追加到CSV(合并数据, 代码, 名称)
+                            if 同步更新CSV:
+                                if 代码 not in CSV批量更新:
+                                    CSV批量更新[代码] = {"名称": 名称, "数据": []}
+                                CSV批量更新[代码]["数据"].append(标准数据)
 
-    # 5. 更新Parquet文件
-    if 所有新数据:
-        print("\n正在更新Parquet文件...")
-        新增合并 = pd.concat(所有新数据, ignore_index=True)
-        更新后 = pd.concat([现有数据, 新增合并], ignore_index=True)
-        更新后 = 更新后.drop_duplicates(subset=["stock_code", "date"], keep="last")
-        更新后 = 更新后.sort_values(["stock_code", "date"]).reset_index(drop=True)
-        更新后.to_parquet(合并数据路径, engine="pyarrow", compression="snappy", index=False)
+                        if 已完成 % 50 == 0 or 已完成 == 总任务数:
+                            print(f"  进度: {已完成}/{总任务数}")
 
-    # 6. 打印摘要
-    print(f"\n{'='*60}")
-    print(f"更新完成！")
-    print(f"  更新股票: {更新股票数} 只")
-    print(f"  新增数据: {新增行数:,} 行")
-    print(f"  无需更新: {跳过数} 只")
-    print(f"  更新失败: {len(失败列表)} 只")
+                    except Exception as e:
+                        失败列表.append((代码, 名称, str(e)))
+                        if 已完成 % 50 == 0 or 已完成 == 总任务数:
+                            print(f"  进度: {已完成}/{总任务数}")
 
-    if 失败列表:
-        print(f"\n失败详情:")
-        for 代码, 名称, 原因 in 失败列表[:20]:
-            print(f"  {代码} {名称}: {原因}")
-        if len(失败列表) > 20:
-            print(f"  ...还有 {len(失败列表) - 20} 只")
+        # 批量写入CSV（减少磁盘IO）- 可选
+        if 同步更新CSV and CSV批量更新:
+            print(f"\n正在更新 {len(CSV批量更新)} 个CSV文件...")
+            for 代码, 信息 in CSV批量更新.items():
+                名称 = 信息["名称"]
+                合并数据 = pd.concat(信息["数据"], ignore_index=True)
+                追加到CSV(合并数据, 代码, 名称)
 
-    print(f"{'='*60}")
+        # 5. 更新Parquet文件
+        if 所有新数据:
+            print("\n正在更新Parquet文件...")
+            新增合并 = pd.concat(所有新数据, ignore_index=True)
+            新增合并 = 新增合并[_有效股票代码(新增合并["stock_code"])]
+            更新后 = pd.concat([现有数据, 新增合并], ignore_index=True)
+            更新后 = 更新后.drop_duplicates(subset=["stock_code", "date"], keep="last")
+            更新后 = 更新后.sort_values(["stock_code", "date"]).reset_index(drop=True)
+            更新后.to_parquet(合并数据路径, engine="pyarrow", compression="snappy", index=False)
+
+        # 6. 打印摘要
+        print(f"\n{'='*60}")
+        print("更新完成！")
+        print(f"  更新股票: {更新股票数} 只")
+        print(f"  新增数据: {新增行数:,} 行")
+        print(f"  无需更新: {跳过数} 只")
+        print(f"  更新失败: {len(失败列表)} 只")
+
+        if 失败列表:
+            print("\n失败详情:")
+            for 代码, 名称, 原因 in 失败列表[:20]:
+                print(f"  {代码} {名称}: {原因}")
+            if len(失败列表) > 20:
+                print(f"  ...还有 {len(失败列表) - 20} 只")
+
+        print(f"{'='*60}")
+    finally:
+        释放BaoStock锁()
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     智能更新()

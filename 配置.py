@@ -1,14 +1,16 @@
 """统一配置文件"""
 
+import os
 from pathlib import Path
 
 # ==================== 路径配置 ====================
 
-# 原始CSV文件目录（只读）
-原始CSV目录 = Path(r"D:\Quant\Data\stock_data_sina_raw")
+# 项目根目录（自动定位为当前配置文件所在目录）
+项目目录 = Path(__file__).resolve().parent
 
-# 项目根目录
-项目目录 = Path(r"D:\CLAUDE CODE项目\股票数据维护")
+# 原始CSV文件目录（只读）
+# 可通过环境变量 STOCK_RAW_CSV_DIR 覆盖默认路径
+原始CSV目录 = Path(os.getenv("STOCK_RAW_CSV_DIR", str(项目目录 / "数据" / "原始CSV")))
 
 # 合并后的Parquet文件
 合并数据路径 = 项目目录 / "数据" / "全市场历史数据.parquet"
@@ -43,6 +45,9 @@ BAOSTOCK_FIELDS = "date,open,high,low,close,volume,amount,turn"
 
 # 频率：d=日线
 频率 = "d"
+
+# 日线更新并发进程数（建议 2-6）
+日线并发进程数 = 3
 
 # 是否同步更新原始CSV文件（False=仅更新Parquet，速度快10倍）
 同步更新CSV = False
