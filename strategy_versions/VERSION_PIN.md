@@ -1,11 +1,20 @@
-﻿# Strategy version pin
+﻿# 策略版本固定说明
 
-Pinned stable version: `legacy`
+## 当前固定版本
+- 固定版本名称：`老版最终版`
+- 默认执行脚本：`strategy_versions/combined_strategy_最终版.py`
+- 等价稳定脚本：`strategy_versions/combined_strategy_stable_legacy.py`
 
-- Stable script: `strategy_versions/combined_strategy_stable_legacy.py`
-- Source snapshot: `strategy_versions/combined_strategy_legacy_v20260220.py`
-- Pin date: 2026-02-20
+## 来源映射
+- 原始快照：`strategy_versions/combined_strategy_legacy_v20260220.py`
+- 固定日期：`2026-02-20`
 
-Notes:
-- This is the retained baseline for future comparisons.
-- New experiments should be based on separate files and must not overwrite this stable script.
+## 当前规则状态
+- 已纳入新增过滤：月线 `MA16` 至少走平（`当前 MA16 >= 上期 MA16`）。
+- 本规则已同步到：
+  - `strategy_versions/combined_strategy_最终版.py`
+  - `strategy_versions/combined_strategy_stable_legacy.py`
+
+## 维护约束
+- 后续策略微调请新建版本文件，不要直接覆盖 `strategy_versions/combined_strategy_最终版.py`。
+- 做效果对比时，统一以“老版最终版”为基线。

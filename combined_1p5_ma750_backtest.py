@@ -1,4 +1,6 @@
 import argparse
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -102,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Daily history days before start-date for Part1 replay",
     )
     parser.add_argument("--progress-every", type=int, default=200, help="Progress print interval")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel workers; <=0 means auto",
+    )
 
     parser.add_argument("--split-date", default="2019-01-01")
     parser.add_argument("--pre-window", type=int, default=32)
@@ -577,6 +585,125 @@ def write_outputs(
     print(summary_df.to_string(index=False))
 
 
+def process_one_stock(
+    stock_code: str,
+    args: argparse.Namespace,
+    part1_cfg: Config,
+    daily_start: str,
+    latest_daily: str,
+    warmup_start: str,
+    analysis_end: str,
+    signal_start_ts: pd.Timestamp,
+    signal_end_ts: pd.Timestamp,
+    resonance_bull_month_window: int,
+    part1_match_month_window: int,
+) -> Tuple[List[Dict[str, object]], Optional[str]]:
+    try:
+        daily_df = load_stock_data_daily(args.daily_data, stock_code, daily_start, latest_daily)
+        if daily_df.empty:
+            return [], "no_daily_data"
+
+        daily_df = daily_df.copy()
+        daily_df["stock_code"] = daily_df["stock_code"].map(normalize_stock_code)
+        daily_df["date_dt"] = pd.to_datetime(daily_df["date"], errors="coerce")
+        daily_df = daily_df.dropna(subset=["date_dt"]).sort_values("date_dt").reset_index(drop=True)
+        if daily_df.empty:
+            return [], "no_valid_daily_data"
+        daily_df["turnover"] = pd.to_numeric(daily_df["turnover"], errors="coerce").fillna(0.0)
+        month_turnover_map = build_month_turnover_map(daily_df)
+
+        part1_input = daily_df.rename(columns={"stock_code": "code"})[
+            ["date", "code", "open", "high", "low", "close"]
+        ].copy()
+        part1_input["date"] = pd.to_datetime(part1_input["date"], errors="coerce")
+        part1_input = part1_input.dropna(subset=["date"])
+        if part1_input.empty:
+            return [], "no_part1_input_data"
+        listing_date = pd.Timestamp(daily_df["date_dt"].iloc[0])
+        part1_dates_raw, part1_reason = collect_part1_signal_dates_for_code(
+            code=stock_code,
+            df_code_daily=part1_input,
+            listing_date=listing_date,
+            cfg=part1_cfg,
+        )
+        if not part1_dates_raw:
+            return [], part1_reason or "no_part1_signal"
+        part1_dates = sorted({pd.Timestamp(d) for d in part1_dates_raw})
+
+        intraday_df = load_stock_data_15m(args.data15, stock_code, warmup_start, analysis_end)
+        if intraday_df.empty:
+            return [], "no_intraday_data"
+
+        day_state = build_intraday_daily_states(
+            intraday_df,
+            start_date=args.start_date,
+            end_date=analysis_end,
+            tolerance=args.tolerance,
+        )
+        part2_events, part2_reason = build_part2_candidates(
+            day_state=day_state,
+            signal_start=signal_start_ts,
+            signal_end=signal_end_ts,
+            month_window=resonance_bull_month_window,
+        )
+        if not part2_events:
+            return [], part2_reason or "no_part2_candidate"
+
+        daily_price = prepare_daily_price_frame(daily_df)
+        stock_names = intraday_df["stock_name"].dropna()
+        stock_name = str(stock_names.iloc[0]) if not stock_names.empty else ""
+
+        rows: List[Dict[str, object]] = []
+        for event in part2_events:
+            resonance_date = event["resonance_date"]
+            bull_start_date = event["bull_start_date"]
+            bull_end_date = event["bull_end_date"]
+            if not month_turnover_condition_ok(
+                month_turnover_map=month_turnover_map,
+                resonance_date=resonance_date,
+                lookback_months=18,
+                threshold=1.0,
+            ):
+                continue
+
+            matched = find_part1_match_date(
+                part1_dates,
+                resonance_date,
+                part1_match_month_window,
+            )
+            if matched is None:
+                continue
+            part1_date, gap_days = matched
+            base_close, ret_map, valid_map = evaluate_forward_returns(
+                daily_price=daily_price,
+                bull_start_date=bull_start_date,
+                windows=FORWARD_WINDOWS,
+            )
+
+            row: Dict[str, object] = {
+                "stock_code": normalize_stock_code(stock_code),
+                "stock_name": stock_name,
+                "signal_date": resonance_date.date().isoformat(),
+                "resonance_date": resonance_date.date().isoformat(),
+                "bull_start_date": bull_start_date.date().isoformat(),
+                "bull_end_date": bull_end_date.date().isoformat(),
+                "part1_date": part1_date.date().isoformat(),
+                "part1_res_gap_days": int(gap_days),
+                "resonance_to_bull_days": int((bull_start_date - resonance_date).days),
+                "base_close_bull_start": base_close,
+            }
+            for window in FORWARD_WINDOWS:
+                row[f"ret_max_high_{window}d"] = ret_map[window]
+                row[f"valid_{window}d"] = bool(valid_map[window])
+            rows.append(row)
+
+        if not rows:
+            return [], "no_part1_or_turnover_match"
+        return rows, None
+    except Exception as exc:
+        return [], f"error:{type(exc).__name__}"
+
+
 def run_backtest(args: argparse.Namespace) -> None:
     latest_15m = find_latest_trade_date(args.data15)
     latest_daily = find_latest_trade_date(args.daily_data)
@@ -626,6 +753,10 @@ def run_backtest(args: argparse.Namespace) -> None:
 
     stock_codes = get_stock_universe(args.data15, args.start_date, end_date)
     print(f"[INFO] stock_universe={len(stock_codes)}")
+    workers = int(args.workers)
+    if workers <= 0:
+        workers = max(1, min(8, (os.cpu_count() or 1)))
+    print(f"[INFO] workers={workers}")
 
     part1_cfg = Config(
         data="",
@@ -645,120 +776,66 @@ def run_backtest(args: argparse.Namespace) -> None:
     results: List[Dict[str, object]] = []
     skipped: List[Dict[str, str]] = []
 
-    for idx, stock_code in enumerate(stock_codes, start=1):
-        daily_df = load_stock_data_daily(args.daily_data, stock_code, daily_start, latest_daily)
-        if daily_df.empty:
-            skipped.append({"stock_code": stock_code, "reason": "no_daily_data"})
-            continue
-
-        daily_df = daily_df.copy()
-        daily_df["stock_code"] = daily_df["stock_code"].map(normalize_stock_code)
-        daily_df["date_dt"] = pd.to_datetime(daily_df["date"], errors="coerce")
-        daily_df = daily_df.dropna(subset=["date_dt"]).sort_values("date_dt").reset_index(drop=True)
-        if daily_df.empty:
-            skipped.append({"stock_code": stock_code, "reason": "no_valid_daily_data"})
-            continue
-        daily_df["turnover"] = pd.to_numeric(daily_df["turnover"], errors="coerce").fillna(0.0)
-        month_turnover_map = build_month_turnover_map(daily_df)
-
-        part1_input = daily_df.rename(columns={"stock_code": "code"})[
-            ["date", "code", "open", "high", "low", "close"]
-        ].copy()
-        part1_input["date"] = pd.to_datetime(part1_input["date"], errors="coerce")
-        part1_input = part1_input.dropna(subset=["date"])
-        if part1_input.empty:
-            skipped.append({"stock_code": stock_code, "reason": "no_part1_input_data"})
-            continue
-        listing_date = pd.Timestamp(daily_df["date_dt"].iloc[0])
-        part1_dates_raw, part1_reason = collect_part1_signal_dates_for_code(
-            code=stock_code,
-            df_code_daily=part1_input,
-            listing_date=listing_date,
-            cfg=part1_cfg,
-        )
-        if not part1_dates_raw:
-            skipped.append({"stock_code": stock_code, "reason": part1_reason or "no_part1_signal"})
-            continue
-        part1_dates = sorted({pd.Timestamp(d) for d in part1_dates_raw})
-
-        intraday_df = load_stock_data_15m(args.data15, stock_code, warmup_start, analysis_end)
-        if intraday_df.empty:
-            skipped.append({"stock_code": stock_code, "reason": "no_intraday_data"})
-            continue
-
-        day_state = build_intraday_daily_states(
-            intraday_df,
-            start_date=args.start_date,
-            end_date=analysis_end,
-            tolerance=args.tolerance,
-        )
-        part2_events, part2_reason = build_part2_candidates(
-            day_state=day_state,
-            signal_start=signal_start_ts,
-            signal_end=signal_end_ts,
-            month_window=resonance_bull_month_window,
-        )
-        if not part2_events:
-            skipped.append({"stock_code": stock_code, "reason": part2_reason or "no_part2_candidate"})
-            continue
-
-        daily_price = prepare_daily_price_frame(daily_df)
-        stock_names = intraday_df["stock_name"].dropna()
-        stock_name = str(stock_names.iloc[0]) if not stock_names.empty else ""
-
-        matched_events = 0
-        for event in part2_events:
-            resonance_date = event["resonance_date"]
-            bull_start_date = event["bull_start_date"]
-            bull_end_date = event["bull_end_date"]
-            if not month_turnover_condition_ok(
-                month_turnover_map=month_turnover_map,
-                resonance_date=resonance_date,
-                lookback_months=18,
-                threshold=1.0,
-            ):
-                continue
-
-            matched = find_part1_match_date(
-                part1_dates,
-                resonance_date,
-                part1_match_month_window,
+    if workers <= 1:
+        for idx, stock_code in enumerate(stock_codes, start=1):
+            rows, reason = process_one_stock(
+                stock_code=stock_code,
+                args=args,
+                part1_cfg=part1_cfg,
+                daily_start=daily_start,
+                latest_daily=latest_daily,
+                warmup_start=warmup_start,
+                analysis_end=analysis_end,
+                signal_start_ts=signal_start_ts,
+                signal_end_ts=signal_end_ts,
+                resonance_bull_month_window=resonance_bull_month_window,
+                part1_match_month_window=part1_match_month_window,
             )
-            if matched is None:
-                continue
-            part1_date, gap_days = matched
-            base_close, ret_map, valid_map = evaluate_forward_returns(
-                daily_price=daily_price,
-                bull_start_date=bull_start_date,
-                windows=FORWARD_WINDOWS,
-            )
+            if rows:
+                results.extend(rows)
+            else:
+                skipped.append({"stock_code": stock_code, "reason": reason or "unknown"})
 
-            row: Dict[str, object] = {
-                "stock_code": normalize_stock_code(stock_code),
-                "stock_name": stock_name,
-                "signal_date": resonance_date.date().isoformat(),
-                "resonance_date": resonance_date.date().isoformat(),
-                "bull_start_date": bull_start_date.date().isoformat(),
-                "bull_end_date": bull_end_date.date().isoformat(),
-                "part1_date": part1_date.date().isoformat(),
-                "part1_res_gap_days": int(gap_days),
-                "resonance_to_bull_days": int((bull_start_date - resonance_date).days),
-                "base_close_bull_start": base_close,
-            }
-            for window in FORWARD_WINDOWS:
-                row[f"ret_max_high_{window}d"] = ret_map[window]
-                row[f"valid_{window}d"] = bool(valid_map[window])
-            results.append(row)
-            matched_events += 1
+            if idx % args.progress_every == 0 or idx == len(stock_codes):
+                print(
+                    f"[PROGRESS] {idx}/{len(stock_codes)} stocks processed, "
+                    f"signals={len(results)}, skipped={len(skipped)}"
+                )
+    else:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for stock_code in stock_codes:
+                fut = executor.submit(
+                    process_one_stock,
+                    stock_code,
+                    args,
+                    part1_cfg,
+                    daily_start,
+                    latest_daily,
+                    warmup_start,
+                    analysis_end,
+                    signal_start_ts,
+                    signal_end_ts,
+                    resonance_bull_month_window,
+                    part1_match_month_window,
+                )
+                futures[fut] = stock_code
 
-        if matched_events == 0:
-            skipped.append({"stock_code": stock_code, "reason": "no_part1_or_turnover_match"})
+            done_count = 0
+            for fut in as_completed(futures):
+                done_count += 1
+                stock_code = futures[fut]
+                rows, reason = fut.result()
+                if rows:
+                    results.extend(rows)
+                else:
+                    skipped.append({"stock_code": stock_code, "reason": reason or "unknown"})
 
-        if idx % args.progress_every == 0 or idx == len(stock_codes):
-            print(
-                f"[PROGRESS] {idx}/{len(stock_codes)} stocks processed, "
-                f"signals={len(results)}, skipped={len(skipped)}"
-            )
+                if done_count % args.progress_every == 0 or done_count == len(stock_codes):
+                    print(
+                        f"[PROGRESS] {done_count}/{len(stock_codes)} stocks processed, "
+                        f"signals={len(results)}, skipped={len(skipped)}"
+                    )
 
     signal_df = pd.DataFrame(results)
     if not signal_df.empty:
