@@ -1,83 +1,131 @@
-"""实时显示15分钟数据下载进度"""
+"""实时显示15分钟下载进度看板。"""
+
+from __future__ import annotations
 
 import json
+import os
 import time
+from collections import deque
+from datetime import timedelta
 from pathlib import Path
-from 配置15分钟 import 进度文件路径, 临时文件目录
 
-def 显示进度条(当前, 总数, 宽度=50):
-    """绘制进度条"""
-    百分比 = 当前 / 总数 if 总数 > 0 else 0
-    已完成块 = int(宽度 * 百分比)
-    进度条 = '=' * 已完成块 + '-' * (宽度 - 已完成块)
-    百分比显示 = f"{百分比*100:.1f}%"
-    return f"[{进度条}] {百分比显示} ({当前}/{总数})"
+import pandas as pd
+from 配置15分钟 import 临时文件目录, 开始日期, 批量大小, 进度文件路径
 
-def 获取进度():
-    """获取当前下载进度"""
-    # 方法1: 读取进度文件
-    已完成股票数 = 0
-    if 进度文件路径.exists():
-        try:
-            with open(进度文件路径, 'r', encoding='utf-8') as f:
-                进度数据 = json.load(f)
-                已完成股票数 = 进度数据.get('完成数量', 0)
-        except:
-            pass
 
-    # 方法2: 统计临时文件数量
-    临时批次数 = 0
-    if 临时文件目录.exists():
-        临时批次数 = len(list(临时文件目录.glob("batch_*.parquet")))
+def _fmt_eta(seconds: float) -> str:
+    if seconds <= 0:
+        return "00:00:00"
+    return str(timedelta(seconds=int(seconds)))
 
-    return 已完成股票数, 临时批次数
 
-def 主循环():
-    """主循环：每5秒刷新一次"""
-    总股票数 = 5180
-    总批次数 = 52
+def _bar(done: int, total: int, width: int = 50) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    ratio = max(0.0, min(1.0, done / total))
+    filled = int(width * ratio)
+    return "[" + "=" * filled + "-" * (width - filled) + "]"
 
-    print("="*70)
-    print("15分钟数据下载进度监控")
-    print("="*70)
-    print("按 Ctrl+C 退出监控（不会影响下载）\n")
+
+def _detect_total_stocks() -> int:
+    data_dir = Path("数据")
+    if not data_dir.exists():
+        return 0
+    daily = None
+    for p in data_dir.glob("*.parquet"):
+        if "历史" in p.name:
+            daily = p
+            break
+    if daily is None:
+        files = sorted(data_dir.glob("*.parquet"), key=lambda x: x.stat().st_size)
+        if not files:
+            return 0
+        daily = files[0]
+    df = pd.read_parquet(daily, columns=["stock_code"])
+    return int(df["stock_code"].nunique())
+
+
+def _load_progress(progress_path: Path) -> int:
+    if not progress_path.exists():
+        return 0
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return 0
+
+    done = 0
+    for value in data.values():
+        if isinstance(value, list):
+            done = max(done, len(value))
+        elif isinstance(value, int):
+            done = max(done, value)
+    return done
+
+
+def _count_batch_files(temp_dir: Path) -> int:
+    if not temp_dir.exists():
+        return 0
+    return len(list(temp_dir.glob("batch_*.parquet")))
+
+
+def main() -> None:
+    total = _detect_total_stocks()
+    total_batches = (total + 批量大小 - 1) // 批量大小 if total > 0 else 0
+    history: deque[tuple[float, int]] = deque(maxlen=120)
 
     try:
         while True:
-            已完成股票, 已完成批次 = 获取进度()
+            now = time.time()
+            done = _load_progress(进度文件路径)
+            batches = _count_batch_files(临时文件目录)
+            history.append((now, done))
 
-            # 清屏（Windows）
-            print("\033[H\033[J", end="")
+            speed = 0.0
+            if len(history) >= 2:
+                t0, d0 = history[0]
+                dt = now - t0
+                if dt > 0:
+                    speed = max(0.0, (done - d0) / dt)
 
-            print("="*70)
-            print(f"下载时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*70)
+            remaining = max(0, total - done)
+            eta = (remaining / speed) if speed > 0 else 0
+            pct = (done / total * 100.0) if total > 0 else 0.0
 
-            print(f"\n股票进度:")
-            print(f"  {显示进度条(已完成股票, 总股票数, 60)}")
-            print(f"  已完成: {已完成股票} 只")
-            print(f"  剩余: {总股票数 - 已完成股票} 只")
+            os.system("cls" if os.name == "nt" else "clear")
+            print("=" * 76)
+            print("15分钟下载实时看板")
+            print("=" * 76)
+            print(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"下载范围: {开始日期} ~ today")
+            print()
 
-            print(f"\n批次进度:")
-            print(f"  {显示进度条(已完成批次, 总批次数, 60)}")
-            print(f"  已完成: {已完成批次} 批")
-            print(f"  剩余: {总批次数 - 已完成批次} 批")
+            print("股票进度")
+            print(f"  {_bar(done, total, 60)} {pct:6.2f}%")
+            print(f"  已完成: {done:,} / {total:,}")
+            print(f"  剩余:   {remaining:,}")
+            print()
 
-            if 已完成股票 > 0:
-                预计剩余分钟 = (总股票数 - 已完成股票) * 1.5 / 60
-                print(f"\n预计剩余时间: {预计剩余分钟:.0f} 分钟 ({预计剩余分钟/60:.1f} 小时)")
+            batch_pct = (batches / total_batches * 100.0) if total_batches > 0 else 0.0
+            print("批次进度")
+            print(f"  {_bar(batches, total_batches, 60)} {batch_pct:6.2f}%")
+            print(f"  批次文件: {batches:,} / {total_batches:,} (batch size={批量大小})")
+            print()
 
-            if 已完成股票 >= 总股票数:
-                print("\n" + "="*70)
-                print("下载完成！")
-                print("="*70)
-                break
+            print("速度与预计")
+            print(f"  当前速度: {speed:.2f} 只/秒")
+            print(f"  预计剩余: {_fmt_eta(eta)}")
+            print()
 
-            print("\n刷新: 每5秒自动更新...")
-            time.sleep(5)
+            print(f"进度文件: {进度文件路径}")
+            print(f"临时目录: {临时文件目录}")
+            print()
+            print("按 Ctrl+C 退出看板（不会影响下载任务）")
 
+            time.sleep(2)
     except KeyboardInterrupt:
-        print("\n\n监控已停止（下载仍在后台继续）")
+        print("\n看板已退出。")
+
 
 if __name__ == "__main__":
-    主循环()
+    main()

@@ -28,7 +28,7 @@ BAOSTOCK_15MIN_FIELDS = "date,time,code,open,high,low,close,volume,amount"
 # ==================== 时间范围配置 ====================
 
 # 下载起始日期
-开始日期 = "2024-01-01"
+开始日期 = "2020-01-01"
 
 # 结束日期（None表示今天）
 结束日期 = None
