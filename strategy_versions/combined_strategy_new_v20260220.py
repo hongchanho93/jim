@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -200,9 +201,10 @@ def load_stock_data_daily(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
+    columns = get_daily_read_columns(data_path)
     table = pq.read_table(
         data_path,
-        columns=["stock_code", "stock_name", "date", "open", "high", "low", "close", "turnover"],
+        columns=columns,
         filters=[
             ("stock_code", "=", stock_code),
             ("date", ">=", start_date),
@@ -212,6 +214,39 @@ def load_stock_data_daily(
     if table.num_rows == 0:
         return pd.DataFrame()
     return table.to_pandas()
+
+
+@lru_cache(maxsize=8)
+def get_daily_read_columns(data_path: str) -> List[str]:
+    base_cols: List[str] = [
+        "stock_code",
+        "stock_name",
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "turnover",
+    ]
+    schema_cols = set(pq.read_schema(data_path).names)
+    if {"volume", "outstanding_share"}.issubset(schema_cols):
+        base_cols.extend(["volume", "outstanding_share"])
+    return base_cols
+
+
+def normalized_turnover_daily(daily_df: pd.DataFrame) -> pd.Series:
+    turnover = pd.to_numeric(daily_df.get("turnover"), errors="coerce")
+    if turnover is None:
+        turnover = pd.Series(index=daily_df.index, dtype=float)
+
+    if {"volume", "outstanding_share"}.issubset(daily_df.columns):
+        volume = pd.to_numeric(daily_df["volume"], errors="coerce")
+        shares = pd.to_numeric(daily_df["outstanding_share"], errors="coerce")
+        valid = volume.notna() & shares.notna() & (volume >= 0) & (shares > 0)
+        # Normalize mixed-unit turnover using the canonical volume/share ratio.
+        turnover.loc[valid] = volume.loc[valid] / shares.loc[valid]
+
+    return turnover.fillna(0.0)
 
 
 def add_clean_close(df: pd.DataFrame) -> pd.DataFrame:
@@ -409,7 +444,8 @@ def build_month_turnover_map(daily_df: pd.DataFrame) -> Dict[int, float]:
     if daily_df.empty:
         return {}
     month_ord = daily_df["date_dt"].dt.year * 12 + daily_df["date_dt"].dt.month
-    return daily_df.groupby(month_ord, sort=False)["turnover"].sum().to_dict()
+    turnover_daily = normalized_turnover_daily(daily_df)
+    return turnover_daily.groupby(month_ord, sort=False).sum().to_dict()
 
 
 def month_turnover_condition_ok(

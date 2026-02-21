@@ -268,8 +268,20 @@ def map_signal_to_trade_idx(trade_dates: np.ndarray, signal_date: pd.Timestamp) 
 
 
 def build_month_turnover_map(g: pd.DataFrame) -> Dict[int, float]:
+    turnover_daily = g['turnover'].copy()
+    if {'volume', 'outstanding_share'}.issubset(g.columns):
+        valid = (
+            g['volume'].notna()
+            & g['outstanding_share'].notna()
+            & (g['volume'] >= 0)
+            & (g['outstanding_share'] > 0)
+        )
+        # Normalize mixed-unit turnover using the canonical formula.
+        turnover_daily.loc[valid] = g.loc[valid, 'volume'] / g.loc[valid, 'outstanding_share']
+
+    turnover_daily = pd.to_numeric(turnover_daily, errors='coerce').fillna(0.0)
     month_ord = g['date'].dt.year * 12 + g['date'].dt.month
-    return g.groupby(month_ord, sort=False)['turnover'].sum().to_dict()
+    return turnover_daily.groupby(month_ord, sort=False).sum().to_dict()
 
 
 def turnover_condition_ok(month_turn_map: Dict[int, float], signal_date: pd.Timestamp) -> bool:
@@ -308,14 +320,17 @@ def main() -> None:
     print('USING_DAILY', daily_file)
     print('USING_15M', m15_file)
 
-    daily = pd.read_parquet(
-        daily_file,
-        columns=['stock_code', 'stock_name', 'date', 'open', 'high', 'low', 'close', 'turnover'],
-    )
+    daily_cols = ['stock_code', 'stock_name', 'date', 'open', 'high', 'low', 'close', 'turnover']
+    daily_schema = set(pq.read_schema(daily_file).names)
+    if {'volume', 'outstanding_share'}.issubset(daily_schema):
+        daily_cols.extend(['volume', 'outstanding_share'])
+
+    daily = pd.read_parquet(daily_file, columns=daily_cols)
     daily = daily.rename(columns={'stock_code': 'code'})
     daily['date'] = pd.to_datetime(daily['date'], errors='coerce')
-    for c in ['open', 'high', 'low', 'close', 'turnover']:
-        daily[c] = pd.to_numeric(daily[c], errors='coerce')
+    for c in ['open', 'high', 'low', 'close', 'turnover', 'volume', 'outstanding_share']:
+        if c in daily.columns:
+            daily[c] = pd.to_numeric(daily[c], errors='coerce')
     daily['stock_name'] = daily['stock_name'].astype(str)
     daily = daily.dropna(subset=['code', 'date', 'open', 'high', 'low', 'close', 'turnover'])
     daily = daily.sort_values(['code', 'date']).reset_index(drop=True)
