@@ -11,6 +11,7 @@
 
 ## 当前规则状态
 - 已纳入新增过滤：月线 `MA16` 至少走平（`当前 MA16 >= 上期 MA16`）。
+- 已对齐清洗后换手率口径：优先使用日线 `turnover` 百分比值（`0.35` 表示 `0.35%`），仅在缺失/异常时回退 `volume / outstanding_share * 100`。
 - 本规则已同步到：
   - `strategy_versions/combined_strategy_最终版.py`
   - `strategy_versions/combined_strategy_stable_legacy.py`

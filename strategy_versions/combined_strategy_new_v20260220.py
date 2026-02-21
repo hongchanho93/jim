@@ -242,11 +242,20 @@ def normalized_turnover_daily(daily_df: pd.DataFrame) -> pd.Series:
     if {"volume", "outstanding_share"}.issubset(daily_df.columns):
         volume = pd.to_numeric(daily_df["volume"], errors="coerce")
         shares = pd.to_numeric(daily_df["outstanding_share"], errors="coerce")
-        valid = volume.notna() & shares.notna() & (volume >= 0) & (shares > 0)
-        # Normalize mixed-unit turnover using the canonical volume/share ratio.
-        turnover.loc[valid] = volume.loc[valid] / shares.loc[valid]
+        valid = (
+            (turnover.isna() | (turnover <= 0))
+            & volume.notna()
+            & shares.notna()
+            & (volume >= 0)
+            & (shares > 0)
+        )
+        # Cleaned data uses turnover in percent (0.35 == 0.35%).
+        # Only fallback for missing/invalid turnover in older files.
+        turnover.loc[valid] = volume.loc[valid] / shares.loc[valid] * 100.0
 
-    return turnover.fillna(0.0)
+    turnover = turnover.fillna(0.0)
+    turnover.loc[turnover < 0] = 0.0
+    return turnover
 
 
 def add_clean_close(df: pd.DataFrame) -> pd.DataFrame:

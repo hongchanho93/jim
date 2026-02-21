@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(PYTHONPATH=\"D:/CLAUDE CODE项目/低点1.5倍策略\" python:*)",
+      "Bash(tee:*)",
+      "Bash(tasklist:*)"
+    ]
+  }
+}

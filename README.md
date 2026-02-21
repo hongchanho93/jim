@@ -28,6 +28,7 @@
 4. 换手率过滤
 - 以信号月为基准，向前回看 `18` 个月。
 - 这 `18` 个月里至少有 1 个月月换手率和 `> 1.0`。
+- 换手率口径为清洗后的百分比数值（`0.35` 表示 `0.35%`），按月汇总日线 `turnover`。
 
 5. 新增过滤（2026-02-20 后）
 - 月线 `MA16` 必须“至少走平”：`当前 MA16 >= 上期 MA16`。
@@ -55,6 +56,7 @@
 脚本会在项目上级目录自动搜索 Parquet 文件：
 - 15m 数据需包含列：`stock_code, stock_name, date, time, open, high, low, close`
 - 日线数据需包含列：`stock_code, stock_name, date, open, high, low, close, turnover`
+- 日线 `turnover` 默认按百分比直接使用；仅在缺失/异常时才回退 `volume / outstanding_share * 100`。
 
 ## 运行方式
 在项目根目录执行：

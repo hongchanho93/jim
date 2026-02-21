@@ -268,18 +268,23 @@ def map_signal_to_trade_idx(trade_dates: np.ndarray, signal_date: pd.Timestamp) 
 
 
 def build_month_turnover_map(g: pd.DataFrame) -> Dict[int, float]:
-    turnover_daily = g['turnover'].copy()
+    turnover_daily = pd.to_numeric(g['turnover'], errors='coerce')
     if {'volume', 'outstanding_share'}.issubset(g.columns):
-        valid = (
-            g['volume'].notna()
-            & g['outstanding_share'].notna()
-            & (g['volume'] >= 0)
-            & (g['outstanding_share'] > 0)
+        volume = pd.to_numeric(g['volume'], errors='coerce')
+        shares = pd.to_numeric(g['outstanding_share'], errors='coerce')
+        fallback = (
+            (turnover_daily.isna() | (turnover_daily <= 0))
+            & volume.notna()
+            & shares.notna()
+            & (volume >= 0)
+            & (shares > 0)
         )
-        # Normalize mixed-unit turnover using the canonical formula.
-        turnover_daily.loc[valid] = g.loc[valid, 'volume'] / g.loc[valid, 'outstanding_share']
+        # Cleaned data uses turnover in percent (0.35 == 0.35%).
+        # Only fallback for missing/invalid turnover in older files.
+        turnover_daily.loc[fallback] = volume.loc[fallback] / shares.loc[fallback] * 100.0
 
-    turnover_daily = pd.to_numeric(turnover_daily, errors='coerce').fillna(0.0)
+    turnover_daily = turnover_daily.fillna(0.0)
+    turnover_daily.loc[turnover_daily < 0] = 0.0
     month_ord = g['date'].dt.year * 12 + g['date'].dt.month
     return turnover_daily.groupby(month_ord, sort=False).sum().to_dict()
 
