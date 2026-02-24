@@ -92,11 +92,7 @@ def 获取最近完整交易日() -> str | None:
     if not trades:
         return None
 
-    today_s = today.strftime("%Y-%m-%d")
-    history = [d for d in sorted(trades) if d < today_s]
-    if not history:
-        return None
-    return history[-1]
+    return sorted(trades)[-1]
 
 
 def _有效股票代码(series: pd.Series) -> pd.Series:

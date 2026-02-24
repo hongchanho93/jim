@@ -281,7 +281,7 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
             print("[错误] 未获取到交易日")
             return
 
-        最近交易日 = 交易日[-1] if 交易日[-1] != 今天 else (交易日[-2] if len(交易日) > 1 else 今天)
+        最近交易日 = 交易日[-1]
         需要更新 = 股票最新日期[股票最新日期["last_date"] < 最近交易日].copy()
         需要更新 = 需要更新.sort_values(["last_date", "stock_code"]).reset_index(drop=True)
 

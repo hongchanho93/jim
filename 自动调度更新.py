@@ -99,11 +99,7 @@ def 获取最近完整交易日() -> str | None:
     if not trades:
         return None
 
-    today_s = today.strftime("%Y-%m-%d")
-    hist = [d for d in sorted(trades) if d < today_s]
-    if not hist:
-        return None
-    return hist[-1]
+    return sorted(trades)[-1]
 
 
 def 获取最近完整月份交易日() -> str | None:
