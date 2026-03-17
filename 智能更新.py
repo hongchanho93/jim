@@ -27,6 +27,7 @@ from 配置 import (
     原始CSV目录,
     合并数据路径,
     同步更新CSV,
+    执行时间,
     复权方式,
     输出列名,
     日线并发进程数,
@@ -40,6 +41,14 @@ BAOSTOCK_LOCK = Path(tempfile.gettempdir()) / "baostock.lock"
 批任务大小 = 80
 最大重试次数 = 3
 重试基础间隔 = 1
+
+
+def _完整交易日截止时间() -> datetime.time:
+    try:
+        hour_str, minute_str = 执行时间.split(":")
+        return datetime.time(int(hour_str), int(minute_str))
+    except Exception:
+        return datetime.time(18, 0)
 
 
 def _有效股票代码(series: pd.Series) -> pd.Series:
@@ -66,6 +75,24 @@ def 获取交易日历(开始日期: str, 结束日期: str) -> list[str]:
 def _worker_download_batch(tasks: list[dict]) -> list[dict]:
     import baostock as bs
 
+    def _静默登录() -> object:
+        old_stdout_inner = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            return bs.login()
+        finally:
+            sys.stdout = old_stdout_inner
+
+    def _静默登出() -> None:
+        old_stdout_inner = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        finally:
+            sys.stdout = old_stdout_inner
+
     try:
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         old_stderr = os.dup(2)
@@ -74,12 +101,7 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
         devnull_fd = None
         old_stderr = None
 
-    old_stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        lg = bs.login()
-    finally:
-        sys.stdout = old_stdout
+    lg = _静默登录()
 
     if lg.error_code != "0":
         if devnull_fd is not None:
@@ -125,6 +147,11 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
                 )
                 if rs.error_code != "0":
                     err = rs.error_msg
+                    if "用户未登录" in err:
+                        _静默登出()
+                        lg = _静默登录()
+                        if lg.error_code == "0":
+                            continue
                     if i < 最大重试次数 - 1:
                         time.sleep(重试基础间隔 * (2**i))
                         continue
@@ -161,14 +188,7 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
                 }
             )
 
-    old_stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        bs.logout()
-    except Exception:
-        pass
-    finally:
-        sys.stdout = old_stdout
+    _静默登出()
 
     if devnull_fd is not None:
         try:
@@ -279,6 +299,14 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
 
         if not 交易日:
             print("[错误] 未获取到交易日")
+            return
+
+        截止时间 = _完整交易日截止时间()
+        if datetime.datetime.now().time() < 截止时间 and 交易日[-1] == 今天:
+            交易日 = 交易日[:-1]
+
+        if not 交易日:
+            print("[错误] 当前时间早于完整交易日截止时间，且无可用历史交易日")
             return
 
         最近交易日 = 交易日[-1]

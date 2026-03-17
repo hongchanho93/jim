@@ -1,9 +1,10 @@
-"""自动调度更新（日线 + 月线 + 15分钟）。
+"""自动调度更新（日线 + 月线 + 15分钟 + 30/60分钟派生）。
 
 策略：
-- 每天18:00后执行。
+- 18:00后按最新完整交易日执行。
+- 若错过18:00，后续触发会自动补跑未完成交易日/月或文件修复任务。
 - 触发条件 = 目标交易/月份未完成 或 数据文件快照变化。
-- 顺序执行：日线 -> 月线 -> 15分钟。
+- 顺序执行：日线 -> 月线 -> 15分钟 -> 30/60分钟派生。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import baostock as bs
 
-from 配置 import 合并数据路径
+from 配置 import 合并数据路径, 执行时间
 from 配置15分钟 import 数据15分钟路径
 from 配置月线 import 数据月线路径
 
@@ -27,8 +28,8 @@ from 配置月线 import 数据月线路径
 状态文件 = 项目目录 / "进度" / "自动调度状态.json"
 日志文件 = 项目目录 / "进度" / "自动调度日志.txt"
 
-触发小时 = 18
-触发分钟 = 0
+默认触发小时 = 18
+默认触发分钟 = 0
 
 调度锁 = Path(tempfile.gettempdir()) / "stock_auto_scheduler.lock"
 
@@ -79,9 +80,24 @@ def 快照变化(旧: dict | None, 新: dict) -> bool:
     return 旧 != 新
 
 
-def 现在是否允许执行() -> bool:
+def _同交易日失败且快照未变(state: dict, trade_day: str, snap_now: dict) -> bool:
+    return (
+        state.get("last_failed_trade_day") == trade_day
+        and state.get("last_failed_snapshot") == snap_now
+    )
+
+
+def 获取执行截止时间() -> datetime.time:
+    try:
+        hour_str, minute_str = 执行时间.split(":")
+        return datetime.time(int(hour_str), int(minute_str))
+    except Exception:
+        return datetime.time(默认触发小时, 默认触发分钟)
+
+
+def 现在是否已到截止时间() -> bool:
     now = datetime.datetime.now().time()
-    return now >= datetime.time(触发小时, 触发分钟)
+    return now >= 获取执行截止时间()
 
 
 def 获取最近完整交易日() -> str | None:
@@ -98,8 +114,13 @@ def 获取最近完整交易日() -> str | None:
 
     if not trades:
         return None
-
-    return sorted(trades)[-1]
+    trades = sorted(trades)
+    cutoff = 获取执行截止时间()
+    if datetime.datetime.now().time() < cutoff and trades[-1] == today.strftime("%Y-%m-%d"):
+        trades = trades[:-1]
+    if not trades:
+        return None
+    return trades[-1]
 
 
 def 获取最近完整月份交易日() -> str | None:
@@ -171,21 +192,17 @@ def _管道状态(state: dict, name: str) -> dict:
     return pipelines.setdefault(name, {})
 
 
-def main() -> None:
+def main() -> int:
     if not 获取调度锁():
         log("[SKIP] 调度已在运行，跳过本次触发")
-        return
+        return 0
 
     try:
-        if not 现在是否允许执行():
-            log("[SKIP] 当前时间早于18:00，等待下一次调度")
-            return
-
         lg = bs.login()
         if lg.error_code != "0":
             log(f"[SKIP] BaoStock登录失败: {lg.error_msg}")
             通知("股票自动更新", "BaoStock登录失败，稍后自动重试")
-            return
+            return 1
 
         try:
             trade_day = 获取最近完整交易日()
@@ -196,12 +213,12 @@ def main() -> None:
         if not trade_day:
             log("[SKIP] 未获取到最近完整交易日，下次自动重试")
             通知("股票自动更新", "未获取到交易日，稍后自动重试")
-            return
+            return 1
 
         if not month_day:
             log("[SKIP] 未获取到最近完整月份日期，下次自动重试")
             通知("股票自动更新", "未获取到月线日期，稍后自动重试")
-            return
+            return 1
 
         state = 读取状态()
         now_iso = datetime.datetime.now().isoformat()
@@ -218,16 +235,26 @@ def main() -> None:
         need_monthly = (monthly_state.get("last_month_day") != month_day) or 快照变化(monthly_state.get("snapshot"), monthly_snap_now)
         need_m15 = (m15_state.get("last_trade_day") != trade_day) or 快照变化(m15_state.get("snapshot"), m15_snap_now)
 
+        if need_m15 and _同交易日失败且快照未变(m15_state, trade_day, m15_snap_now):
+            need_m15 = False
+            log(f"[SKIP] 15分钟在当前交易日已失败且文件未变化（{trade_day}），等待文件变化或下个交易日再重试")
+
         log(
             "[INFO] 触发判断: "
             f"daily={need_daily} monthly={need_monthly} m15={need_m15} "
             f"(trade_day={trade_day}, month_day={month_day})"
         )
 
+        if not 现在是否已到截止时间():
+            if not (need_daily or need_monthly or need_m15):
+                log(f"[SKIP] 当前时间早于{执行时间}，且无待补跑/修复任务")
+                return 0
+            log(f"[INFO] 当前时间早于{执行时间}，检测到待补跑/修复任务，继续执行")
+
         if need_daily:
             if not 运行脚本("智能更新.py"):
                 通知("股票自动更新失败", f"日线更新失败（{trade_day}）")
-                return
+                return 1
             daily_state.update(
                 {
                     "last_trade_day": trade_day,
@@ -242,7 +269,7 @@ def main() -> None:
         if need_monthly:
             if not 运行脚本("智能更新月线.py"):
                 通知("股票自动更新失败", f"月线更新失败（{month_day}）")
-                return
+                return 1
             monthly_state.update(
                 {
                     "last_month_day": month_day,
@@ -256,8 +283,16 @@ def main() -> None:
 
         if need_m15:
             if not 运行脚本("智能更新15分钟.py"):
+                m15_state.update(
+                    {
+                        "last_failed_trade_day": trade_day,
+                        "last_failure_time": now_iso,
+                        "last_failed_snapshot": 文件快照(数据15分钟路径),
+                    }
+                )
+                保存状态(state)
                 通知("股票自动更新失败", f"15分钟更新失败（{trade_day}）")
-                return
+                return 1
             m15_state.update(
                 {
                     "last_trade_day": trade_day,
@@ -265,9 +300,16 @@ def main() -> None:
                     "snapshot": 文件快照(数据15分钟路径),
                 }
             )
+            m15_state.pop("last_failed_trade_day", None)
+            m15_state.pop("last_failure_time", None)
+            m15_state.pop("last_failed_snapshot", None)
             保存状态(state)
         else:
             log(f"[SKIP] 15分钟已完成且文件未变更（{trade_day}）")
+
+        if not 运行脚本("派生分钟数据.py"):
+            通知("股票自动更新失败", f"30/60分钟派生失败（{trade_day}）")
+            return 1
 
         state.update(
             {
@@ -280,11 +322,12 @@ def main() -> None:
         保存状态(state)
 
         log("[DONE] 自动更新流程完成")
-        通知("股票自动更新完成", f"已完成日线+月线+15分钟更新（{trade_day} / {month_day}）")
+        通知("股票自动更新完成", f"已完成日线+月线+15/30/60分钟更新（{trade_day} / {month_day}）")
+        return 0
 
     finally:
         释放调度锁()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

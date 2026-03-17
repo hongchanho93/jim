@@ -13,8 +13,8 @@ from 配置 import 计划任务名称, 执行时间, 项目目录
 
 BAT路径 = 项目目录 / "启动更新.bat"
 调度脚本路径 = 项目目录 / "自动调度更新.py"
-任务日志路径 = 项目目录 / "进度" / "自动任务_launchd.log"
 LAUNCHD_LABEL = "com.hongjian.stockdata.autoupdate"
+任务日志路径 = Path.home() / "Library" / "Logs" / f"{LAUNCHD_LABEL}.log"
 LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
@@ -28,6 +28,14 @@ def _解析执行时间() -> tuple[int, int]:
         return int(hour_str), int(minute_str)
     except Exception:
         return 18, 0
+
+
+def _生成半小时日历触发点() -> list[dict[str, int]]:
+    触发点: list[dict[str, int]] = []
+    for hour in range(24):
+        for minute in (0, 30):
+            触发点.append({"Hour": hour, "Minute": minute})
+    return 触发点
 
 
 def 安装_windows():
@@ -82,25 +90,27 @@ def 安装_macos():
         print("请确认 自动调度更新.py 已存在")
         return
 
-    hour, minute = _解析执行时间()
     任务日志路径.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
 
-    python_exec = sys.executable
-    shell_cmd = f"{shlex.quote(python_exec)} {shlex.quote(str(调度脚本路径))}"
-    applescript = f'do shell script "{shell_cmd}"'
+    python_exec = Path(sys.executable).resolve()
+    启动命令 = "exec {python} {script}".format(
+        python=shlex.quote(str(python_exec)),
+        script=shlex.quote(str(调度脚本路径)),
+    )
 
     plist_data = {
         "Label": LAUNCHD_LABEL,
-        # 使用 osascript 执行，规避 launchd 直接访问 Documents 的权限限制
-        "ProgramArguments": ["/usr/bin/osascript", "-e", applescript],
-        "WorkingDirectory": str(项目目录),
-        # 开机登录后先触发一次，用于补跑
-        "RunAtLoad": True,
-        # 每30分钟触发一次，用于断网/临时失败自动重试
-        "StartInterval": 1800,
-        # 18:00的固定触发点
-        "StartCalendarInterval": {"Hour": hour, "Minute": minute},
+        "ProgramArguments": ["/bin/zsh", "-lc", 启动命令],
+        "WorkingDirectory": str(Path.home()),
+        "EnvironmentVariables": {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+            "LANG": os.environ.get("LANG", "zh_CN.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "zh_CN.UTF-8"),
+            "PYTHONUTF8": "1",
+        },
+        # 全天整点/半点触发，由脚本内部判断是否需要补跑
+        "StartCalendarInterval": _生成半小时日历触发点(),
         "StandardOutPath": str(任务日志路径),
         "StandardErrorPath": str(任务日志路径),
     }
@@ -123,7 +133,8 @@ def 安装_macos():
     print(f"  Python: {python_exec}")
     print(f"  日志: {任务日志路径}")
     print(f"  固定时间: 每天 {执行时间}")
-    print("  补偿机制: 开机触发 + 每30分钟重试（脚本内部18:00后才执行更新）")
+    print("  补偿机制: 全天整点/半点自然调度（脚本内部按交易日自动补跑）")
+    print("  安装后不会立即触发，等待下一次自然调度")
 
 
 def 卸载_macos():

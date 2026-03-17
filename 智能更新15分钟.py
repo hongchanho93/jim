@@ -20,6 +20,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from 配置 import 合并数据路径
+from 配置 import 执行时间
 from 配置15分钟 import (
     BAOSTOCK_15MIN_FIELDS,
     复权方式15分钟,
@@ -30,11 +31,20 @@ from 配置15分钟 import (
     频率15分钟,
     重试基础间隔,
 )
+from 派生分钟数据 import 增量更新派生分钟数据
 from 数据清洗规则 import 清洗15分钟
 
 
 并发进程数 = 3
 BAOSTOCK_LOCK = Path(tempfile.gettempdir()) / "baostock.lock"
+
+
+def _完整交易日截止时间() -> datetime.time:
+    try:
+        hour_str, minute_str = 执行时间.split(":")
+        return datetime.time(int(hour_str), int(minute_str))
+    except Exception:
+        return datetime.time(18, 0)
 
 
 def log(msg: str) -> None:
@@ -91,8 +101,12 @@ def 获取最近完整交易日() -> str | None:
 
     if not trades:
         return None
-
-    return sorted(trades)[-1]
+    trades = sorted(trades)
+    if datetime.datetime.now().time() < _完整交易日截止时间() and trades[-1] == today.strftime("%Y-%m-%d"):
+        trades = trades[:-1]
+    if not trades:
+        return None
+    return trades[-1]
 
 
 def _有效股票代码(series: pd.Series) -> pd.Series:
@@ -104,20 +118,35 @@ def _从日线构建股票宇宙() -> pd.DataFrame:
     if not 合并数据路径.exists():
         raise FileNotFoundError(f"日线文件不存在: {合并数据路径}")
 
-    df = pd.read_parquet(合并数据路径, columns=["stock_code", "stock_name", "date"])
+    df = pd.read_parquet(
+        合并数据路径,
+        columns=["stock_code", "stock_name", "date", "volume", "amount"],
+    )
     df["stock_code"] = df["stock_code"].astype(str).str.strip()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df[_有效股票代码(df["stock_code"]) & df["date"].notna()].copy()
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
 
     latest = (
         df.sort_values(["stock_code", "date"], kind="mergesort")
         .drop_duplicates(subset=["stock_code"], keep="last")
-        .loc[:, ["stock_code", "stock_name", "date"]]
+        .loc[:, ["stock_code", "stock_name", "date", "volume", "amount"]]
         .rename(columns={"date": "daily_last"})
         .reset_index(drop=True)
     )
     latest["daily_last"] = latest["daily_last"].dt.strftime("%Y-%m-%d")
-    return latest
+
+    traded = (
+        df[(df["volume"] > 0) | (df["amount"] > 0)]
+        .groupby("stock_code", as_index=False)["date"]
+        .max()
+        .rename(columns={"date": "minute_target_last"})
+    )
+    latest = latest.merge(traded, on="stock_code", how="left")
+    latest["minute_target_last"] = pd.to_datetime(latest["minute_target_last"], errors="coerce").dt.strftime("%Y-%m-%d")
+    latest["minute_target_last"] = latest["minute_target_last"].fillna(latest["daily_last"])
+    return latest.loc[:, ["stock_code", "stock_name", "daily_last", "minute_target_last"]]
 
 
 def _从15分钟文件构建最后日期(path: Path, batch_size: int = 700_000) -> pd.DataFrame:
@@ -175,6 +204,24 @@ def _从15分钟文件构建最后日期(path: Path, batch_size: int = 700_000) 
 def _worker_download(task: dict) -> dict:
     import baostock as bs
 
+    def _静默登录() -> object:
+        old_stdout_inner = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            return bs.login()
+        finally:
+            sys.stdout = old_stdout_inner
+
+    def _静默登出() -> None:
+        old_stdout_inner = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        finally:
+            sys.stdout = old_stdout_inner
+
     code = task["stock_code"]
     name = task["stock_name"]
     start_date = task["start_date"]
@@ -189,12 +236,7 @@ def _worker_download(task: dict) -> dict:
         devnull_fd = None
         old_stderr = None
 
-    old_stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        lg = bs.login()
-    finally:
-        sys.stdout = old_stdout
+    lg = _静默登录()
 
     if lg.error_code != "0":
         if devnull_fd is not None:
@@ -219,6 +261,11 @@ def _worker_download(task: dict) -> dict:
             )
             if rs.error_code != "0":
                 err = rs.error_msg
+                if "用户未登录" in err:
+                    _静默登出()
+                    lg = _静默登录()
+                    if lg.error_code == "0":
+                        continue
                 if i < 最大重试次数 - 1:
                     time.sleep(重试基础间隔 * (2**i))
                     continue
@@ -233,14 +280,7 @@ def _worker_download(task: dict) -> dict:
             if i < 最大重试次数 - 1:
                 time.sleep(重试基础间隔 * (2**i))
 
-    old_stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        bs.logout()
-    except Exception:
-        pass
-    finally:
-        sys.stdout = old_stdout
+    _静默登出()
 
     if devnull_fd is not None:
         try:
@@ -311,6 +351,24 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _计算需更新股票(
+    daily_latest: pd.DataFrame,
+    m15_latest: pd.DataFrame,
+    最近交易日: str,
+) -> pd.DataFrame:
+    joined = daily_latest.merge(
+        m15_latest.loc[:, ["stock_code", "m15_last"]],
+        on="stock_code",
+        how="left",
+    )
+    target = joined["minute_target_last"].fillna(joined["daily_last"])
+    if 最近交易日:
+        target = target.where(target <= 最近交易日, 最近交易日)
+    joined["minute_target_last"] = target
+    need = joined[joined["m15_last"].isna() | (joined["m15_last"] < joined["minute_target_last"])].copy()
+    return need.sort_values(["minute_target_last", "m15_last", "stock_code"], na_position="first").reset_index(drop=True)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -351,13 +409,7 @@ def main() -> None:
         log(f"  最近完整交易日: {最近交易日}")
 
         log("\n[4/7] 计算缺失/滞后股票...")
-        joined = daily_latest.merge(
-            m15_latest.loc[:, ["stock_code", "m15_last"]],
-            on="stock_code",
-            how="left",
-        )
-        need = joined[joined["m15_last"].isna() | (joined["m15_last"] < 最近交易日)].copy()
-        need = need.sort_values(["m15_last", "stock_code"], na_position="first").reset_index(drop=True)
+        need = _计算需更新股票(daily_latest, m15_latest, 最近交易日)
 
         if args.limit_stocks > 0:
             need = need.head(args.limit_stocks).copy()
@@ -458,6 +510,9 @@ def main() -> None:
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
 
+        log("\n[8/8] 同步生成30分钟和60分钟...")
+        增量更新派生分钟数据(新增清洗后, logger=log)
+
         log("\n" + "=" * 70)
         log("15分钟更新完成")
         log(f"  新增行数(清洗后): {len(新增清洗后):,}")
@@ -468,6 +523,15 @@ def main() -> None:
                 log(f"    {code}: {err}")
         log(f"  文件: {数据15分钟路径}")
         log("=" * 70)
+
+        最新索引 = _从15分钟文件构建最后日期(数据15分钟路径)
+        未完成 = _计算需更新股票(daily_latest, 最新索引, 最近交易日)
+        if not 未完成.empty:
+            log("[错误] 仍有股票15分钟数据未补齐，视为本次更新失败")
+            log(f"  未补齐股票数: {len(未完成)}")
+            for _, row in 未完成.head(10).iterrows():
+                log(f"    {row['stock_code']}: m15_last={row['m15_last']}")
+            raise SystemExit(2)
 
     finally:
         释放BaoStock锁()

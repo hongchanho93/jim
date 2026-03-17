@@ -1,5 +1,42 @@
 {
-  "last_completed_trade_day": "2026-02-13",
-  "last_success_time": "2026-02-15T18:26:13.258442",
-  "last_success_host": "hongjiandeMacBook-Air.local"
+  "last_completed_trade_day": "2026-03-17",
+  "last_success_time": "2026-03-17T22:30:05.276778",
+  "last_success_host": "hongjiandeMacBook-Air.local",
+  "pipelines": {
+    "daily": {
+      "last_trade_day": "2026-03-17",
+      "last_success_time": "2026-03-17T18:00:36.997344",
+      "snapshot": {
+        "exists": true,
+        "size": 514410434,
+        "mtime": 1773739874
+      }
+    },
+    "monthly": {
+      "last_month_day": "2026-02-27",
+      "last_success_time": "2026-03-01T18:00:15.024572",
+      "snapshot": {
+        "exists": true,
+        "size": 30670736,
+        "mtime": 1772369595
+      }
+    },
+    "m15": {
+      "last_trade_day": "2026-03-11",
+      "last_success_time": "2026-03-12T02:06:29.639813",
+      "last_failed_trade_day": "2026-03-17",
+      "last_failure_time": "2026-03-17T18:00:36.997344",
+      "last_failed_snapshot": {
+        "exists": true,
+        "size": 1893181334,
+        "mtime": 1773741971
+      },
+      "snapshot": {
+        "exists": true,
+        "size": 1889237664,
+        "mtime": 1773251952
+      }
+    }
+  },
+  "last_completed_month_day": "2026-02-27"
 }
