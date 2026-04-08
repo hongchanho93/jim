@@ -1,0 +1,1 @@
+/Users/hongjian/Documents/CODEX项目/股票数据维护/ma_new_low_ratio_scan.py

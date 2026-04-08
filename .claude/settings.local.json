@@ -4,7 +4,11 @@
       "Bash(python:*)",
       "Bash(PYTHONPATH=\"D:/CLAUDE CODE项目/低点1.5倍策略\" python:*)",
       "Bash(tee:*)",
-      "Bash(tasklist:*)"
+      "Bash(tasklist:*)",
+      "Bash(launchctl list:*)",
+      "Bash(git -C \"/Users/hongjian/Documents/CODEX项目/股票数据维护\" log --oneline --all)",
+      "Bash(git -C \"/Users/hongjian/Documents/CODEX项目/股票数据维护\" diff HEAD -- \"自动调度更新.py\")",
+      "Bash(python3 -c \":*)"
     ]
   }
 }

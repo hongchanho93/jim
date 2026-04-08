@@ -8,6 +8,7 @@ import io
 import os
 import shutil
 import subprocess
+import signal
 import sys
 import tempfile
 import time
@@ -36,7 +37,10 @@ from 数据清洗规则 import 清洗15分钟
 
 
 并发进程数 = 3
+批任务大小 = 80
+逐股验收再跑轮数 = 1
 BAOSTOCK_LOCK = Path(tempfile.gettempdir()) / "baostock.lock"
+单股查询超时秒数 = 120
 
 
 def _完整交易日截止时间() -> datetime.time:
@@ -201,7 +205,7 @@ def _从15分钟文件构建最后日期(path: Path, batch_size: int = 700_000) 
     return out
 
 
-def _worker_download(task: dict) -> dict:
+def _worker_download_batch(tasks: list[dict]) -> list[dict]:
     import baostock as bs
 
     def _静默登录() -> object:
@@ -222,12 +226,6 @@ def _worker_download(task: dict) -> dict:
         finally:
             sys.stdout = old_stdout_inner
 
-    code = task["stock_code"]
-    name = task["stock_name"]
-    start_date = task["start_date"]
-    end_date = task["end_date"]
-    bs_code = 代码转BaoStock格式(code)
-
     try:
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         old_stderr = os.dup(2)
@@ -240,45 +238,95 @@ def _worker_download(task: dict) -> dict:
 
     if lg.error_code != "0":
         if devnull_fd is not None:
-            os.dup2(old_stderr, 2)
-            os.close(old_stderr)
-            os.close(devnull_fd)
-        return {"ok": False, "stock_code": code, "stock_name": name, "error": "login failed"}
+            try:
+                os.dup2(old_stderr, 2)
+                os.close(old_stderr)
+                os.close(devnull_fd)
+            except Exception:
+                pass
+        return [
+            {
+                "ok": False,
+                "stock_code": t["stock_code"],
+                "stock_name": t["stock_name"],
+                "error": "login failed",
+            }
+            for t in tasks
+        ]
 
-    rows = []
-    fields = None
-    err = None
+    def _超时处理(signum, frame):  # noqa: ARG001
+        raise TimeoutError(f"baostock query timed out after {单股查询超时秒数}s")
 
-    for i in range(最大重试次数):
-        try:
-            rs = bs.query_history_k_data_plus(
-                code=bs_code,
-                fields=BAOSTOCK_15MIN_FIELDS,
-                start_date=start_date,
-                end_date=end_date,
-                frequency=频率15分钟,
-                adjustflag=复权方式15分钟,
-            )
-            if rs.error_code != "0":
-                err = rs.error_msg
-                if "用户未登录" in err:
-                    _静默登出()
-                    lg = _静默登录()
-                    if lg.error_code == "0":
+    results: list[dict] = []
+    for task in tasks:
+        code = task["stock_code"]
+        name = task["stock_name"]
+        start_date = task["start_date"]
+        end_date = task["end_date"]
+        bs_code = 代码转BaoStock格式(code)
+        print(f"[worker] query {code} {name} {start_date}->{end_date}", flush=True)
+
+        rows = []
+        fields = None
+        err = None
+
+        for i in range(最大重试次数):
+            try:
+                signal.signal(signal.SIGALRM, _超时处理)
+                signal.alarm(单股查询超时秒数)
+                rs = bs.query_history_k_data_plus(
+                    code=bs_code,
+                    fields=BAOSTOCK_15MIN_FIELDS,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=频率15分钟,
+                    adjustflag=复权方式15分钟,
+                )
+                if rs is None:
+                    err = "query returned none"
+                    if i < 最大重试次数 - 1:
+                        time.sleep(重试基础间隔 * (2**i))
                         continue
+                    break
+                if rs.error_code != "0":
+                    err = rs.error_msg
+                    if "用户未登录" in err:
+                        _静默登出()
+                        lg = _静默登录()
+                        if lg.error_code == "0":
+                            continue
+                    if i < 最大重试次数 - 1:
+                        time.sleep(重试基础间隔 * (2**i))
+                        continue
+                    break
+
+                fields = rs.fields
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                break
+            except Exception as e:
+                err = str(e)
                 if i < 最大重试次数 - 1:
                     time.sleep(重试基础间隔 * (2**i))
-                    continue
-                break
+            finally:
+                try:
+                    signal.alarm(0)
+                except Exception:
+                    pass
 
-            fields = rs.fields
-            while rs.next():
-                rows.append(rs.get_row_data())
-            break
-        except Exception as e:
-            err = str(e)
-            if i < 最大重试次数 - 1:
-                time.sleep(重试基础间隔 * (2**i))
+        if not rows:
+            results.append({"ok": False, "stock_code": code, "stock_name": name, "error": err or "no data"})
+            continue
+
+        results.append(
+            {
+                "ok": True,
+                "stock_code": code,
+                "stock_name": name,
+                "fields": fields,
+                "rows": rows,
+            }
+        )
 
     _静默登出()
 
@@ -290,16 +338,7 @@ def _worker_download(task: dict) -> dict:
         except Exception:
             pass
 
-    if not rows:
-        return {"ok": False, "stock_code": code, "stock_name": name, "error": err or "no data"}
-
-    return {
-        "ok": True,
-        "stock_code": code,
-        "stock_name": name,
-        "fields": fields,
-        "rows": rows,
-    }
+    return results
 
 
 def 转标准格式(rows: list[list[str]], fields: list[str], stock_code: str, stock_name: str) -> pd.DataFrame:
@@ -327,7 +366,7 @@ def _调用低内存合并(batch_dir: Path, output: Path, work_dir: Path) -> Non
         "--work-dir",
         str(work_dir),
         "--prefix-width",
-        "2",
+        "4",
     ]
     r = subprocess.run(cmd, text=True)
     if r.returncode != 0:
@@ -367,6 +406,149 @@ def _计算需更新股票(
     joined["minute_target_last"] = target
     need = joined[joined["m15_last"].isna() | (joined["m15_last"] < joined["minute_target_last"])].copy()
     return need.sort_values(["minute_target_last", "m15_last", "stock_code"], na_position="first").reset_index(drop=True)
+
+
+def _打印逐股验收(need: pd.DataFrame, latest: pd.DataFrame, 最近交易日: str) -> pd.DataFrame:
+    验收 = need.loc[:, ["stock_code", "stock_name", "minute_target_last", "m15_last"]].merge(
+        latest.loc[:, ["stock_code", "m15_last"]].rename(columns={"m15_last": "file_last_date"}),
+        on="stock_code",
+        how="left",
+    )
+    验收["status"] = "ok"
+    验收.loc[验收["file_last_date"].isna() | (验收["file_last_date"] < 验收["minute_target_last"]), "status"] = "lagging"
+
+    ok_count = int((验收["status"] == "ok").sum())
+    lagging_count = int((验收["status"] == "lagging").sum())
+    log("\n[验收] 逐股更新结果:")
+    log(f"  待验收股票数: {len(验收)}")
+    log(f"  已到目标日: {ok_count}")
+    log(f"  仍落后目标日: {lagging_count}")
+
+    def _fmt_date(value: object) -> str:
+        return str(value) if pd.notna(value) else "-"
+
+    if lagging_count:
+        log("  落后样本（全部）:")
+        for _, row in 验收[验收["status"] == "lagging"].iterrows():
+            log(
+                f"    {row['stock_code']} {row['stock_name']}: "
+                f"last_date={_fmt_date(row['file_last_date'])} target={_fmt_date(row['minute_target_last']) if pd.notna(row['minute_target_last']) else 最近交易日}"
+            )
+    return 验收
+
+
+def _补跑滞后股票(
+    当前文件索引: pd.DataFrame,
+    滞后股票: pd.DataFrame,
+    最近交易日: str,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    if 滞后股票.empty:
+        return (
+            pd.DataFrame(columns=["stock_code", "stock_name", "date", "time", "open", "high", "low", "close", "volume", "amount"]),
+            {},
+        )
+
+    lagging_codes = 滞后股票["stock_code"].astype(str).tolist()
+    targets = 当前文件索引[当前文件索引["stock_code"].isin(lagging_codes)].copy()
+    if targets.empty:
+        return (
+            pd.DataFrame(columns=["stock_code", "stock_name", "date", "time", "open", "high", "low", "close", "volume", "amount"]),
+            {},
+        )
+
+    tasks = []
+    for _, r in targets.iterrows():
+        start_date = r["m15_last"] if isinstance(r["m15_last"], str) and r["m15_last"] else 开始日期
+        tasks.append(
+            {
+                "stock_code": r["stock_code"],
+                "stock_name": r["stock_name"],
+                "start_date": start_date,
+                "end_date": 最近交易日,
+                "last_date": r["m15_last"] if isinstance(r["m15_last"], str) else None,
+            }
+        )
+
+    log(f"\n[补跑] 针对 {len(tasks)} 只落后股票立即再跑一轮")
+    batches = [tasks[i : i + 批任务大小] for i in range(0, len(tasks), 批任务大小)]
+    新增列表: list[pd.DataFrame] = []
+    失败列表: list[tuple[str, str]] = []
+    源端无新增代码: dict[str, str] = {}
+    done = 0
+
+    with ProcessPoolExecutor(max_workers=并发进程数) as ex:
+        fut_map = {ex.submit(_worker_download_batch, batch): batch for batch in batches}
+        for fut in as_completed(fut_map):
+            batch_tasks = fut_map[fut]
+            try:
+                results = fut.result()
+            except Exception as e:
+                for t in batch_tasks:
+                    失败列表.append((t["stock_code"], f"batch error: {e}"))
+                    done += 1
+                log(f"  [补跑进度] {done}/{len(tasks)}")
+                continue
+
+            for r in results:
+                done += 1
+                code = r["stock_code"]
+                if not r.get("ok"):
+                    err = r.get("error", "unknown")
+                    if err == "no data":
+                        t = next((item for item in batch_tasks if item["stock_code"] == code), None)
+                        if t is not None:
+                            源端无新增代码[code] = t["stock_name"]
+                    else:
+                        失败列表.append((code, err))
+                    if done % 50 == 0 or done == len(tasks):
+                        log(f"  [补跑进度] {done}/{len(tasks)}")
+                    continue
+
+                t = next((item for item in batch_tasks if item["stock_code"] == code), None)
+                df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
+                last_d = t.get("last_date") if t else None
+                if last_d:
+                    df = df[df["date"] >= last_d]
+                if not df.empty:
+                    新增列表.append(df)
+                else:
+                    if t is not None:
+                        源端无新增代码[code] = t["stock_name"]
+                if done % 50 == 0 or done == len(tasks):
+                    log(f"  [补跑进度] {done}/{len(tasks)}")
+
+    if 失败列表:
+        log(f"  [补跑] 仍有失败股票数: {len(失败列表)}")
+
+    if not 新增列表:
+        return (
+            pd.DataFrame(columns=["stock_code", "stock_name", "date", "time", "open", "high", "low", "close", "volume", "amount"]),
+            源端无新增代码,
+        )
+
+    return pd.concat(新增列表, ignore_index=True), 源端无新增代码
+
+
+def _低内存写回15分钟(新增清洗后: pd.DataFrame) -> None:
+    temp_root = Path(tempfile.gettempdir()) / f"m15_retry_{int(time.time())}"
+    batch_dir = temp_root / "batches"
+    work_dir = temp_root / "work"
+    output_file = temp_root / "merged.parquet"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _硬链接或复制(数据15分钟路径, batch_dir / "batch_000000.parquet")
+        新增清洗后.to_parquet(batch_dir / "batch_000001.parquet", engine="pyarrow", compression="snappy", index=False)
+
+        _调用低内存合并(batch_dir=batch_dir, output=output_file, work_dir=work_dir)
+
+        target_tmp = 数据15分钟路径.with_suffix(数据15分钟路径.suffix + ".tmp")
+        if target_tmp.exists():
+            target_tmp.unlink()
+        shutil.move(str(output_file), str(target_tmp))
+        target_tmp.replace(数据15分钟路径)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def main() -> None:
@@ -439,41 +621,80 @@ def main() -> None:
         失败列表: list[tuple[str, str]] = []
         done = 0
 
+        batches = [tasks[i : i + 批任务大小] for i in range(0, len(tasks), 批任务大小)]
         with ProcessPoolExecutor(max_workers=并发进程数) as ex:
-            fut_map = {ex.submit(_worker_download, t): t for t in tasks}
+            fut_map = {ex.submit(_worker_download_batch, batch): batch for batch in batches}
             for fut in as_completed(fut_map):
-                t = fut_map[fut]
-                done += 1
+                batch_tasks = fut_map[fut]
                 try:
-                    r = fut.result()
+                    results = fut.result()
                 except Exception as e:
-                    失败列表.append((t["stock_code"], str(e)))
-                    if done % 50 == 0 or done == len(tasks):
-                        log(f"  进度: {done}/{len(tasks)}")
-                    continue
-
-                if not r.get("ok"):
-                    err = r.get("error", "unknown")
-                    if err != "no data":
-                        失败列表.append((t["stock_code"], err))
-                    if done % 50 == 0 or done == len(tasks):
-                        log(f"  进度: {done}/{len(tasks)}")
-                    continue
-
-                df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
-                last_d = t.get("last_date")
-                if last_d:
-                    df = df[df["date"] >= last_d]
-                if not df.empty:
-                    新增列表.append(df)
-
-                if done % 50 == 0 or done == len(tasks):
+                    for t in batch_tasks:
+                        失败列表.append((t["stock_code"], f"batch error: {e}"))
+                        done += 1
                     log(f"  进度: {done}/{len(tasks)}")
+                    continue
+
+                for r in results:
+                    done += 1
+                    code = r["stock_code"]
+                    if not r.get("ok"):
+                        err = r.get("error", "unknown")
+                        if err != "no data":
+                            失败列表.append((code, err))
+                        if done % 50 == 0 or done == len(tasks):
+                            log(f"  进度: {done}/{len(tasks)}")
+                        continue
+
+                    t = next((item for item in batch_tasks if item["stock_code"] == code), None)
+                    df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
+                    last_d = t.get("last_date") if t else None
+                    if last_d:
+                        df = df[df["date"] >= last_d]
+                    if not df.empty:
+                        新增列表.append(df)
+
+                    if done % 50 == 0 or done == len(tasks):
+                        log(f"  进度: {done}/{len(tasks)}")
+
+        # 对失败的股票串行重试（独立BaoStock会话，避免并发连接争用）
+        if 失败列表:
+            log(f"\n[重试] {len(失败列表)} 个失败股票串行重试（独立会话）...")
+            still_失败: list[tuple[str, str]] = []
+            task_map = {t["stock_code"]: t for t in tasks}
+            for code, err_orig in 失败列表:
+                t = task_map.get(code)
+                if t is None:
+                    still_失败.append((code, err_orig))
+                    continue
+                retry_results = _worker_download_batch([t])
+                r = retry_results[0] if retry_results else {"ok": False, "error": "retry returned no result"}
+                if r.get("ok"):
+                    df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
+                    last_d = t.get("last_date")
+                    if last_d:
+                        df = df[df["date"] >= last_d]
+                    if not df.empty:
+                        新增列表.append(df)
+                    log(f"    [重试成功] {code}")
+                else:
+                    still_失败.append((code, r.get("error", "unknown")))
+            失败列表 = still_失败
+            if 失败列表:
+                log(f"  重试后仍失败: {len(失败列表)}")
+            else:
+                log("  所有失败股票重试成功")
 
         if not 新增列表:
-            log("\n未下载到新增15分钟数据。")
             if 失败列表:
+                log("\n[错误] 未下载到新增15分钟数据，且仍存在真实失败股票。")
                 log(f"失败股票数: {len(失败列表)}")
+                log("失败样本（前10）:")
+                for code, err in 失败列表[:10]:
+                    log(f"    {code}: {err}")
+                raise SystemExit(2)
+
+            log("\n[提示] 未下载到新增15分钟数据，但滞后股票均已判定为源端无更晚数据。")
             return
 
         log("\n[6/7] 清洗新增数据...")
@@ -525,11 +746,41 @@ def main() -> None:
         log("=" * 70)
 
         最新索引 = _从15分钟文件构建最后日期(数据15分钟路径)
-        未完成 = _计算需更新股票(daily_latest, 最新索引, 最近交易日)
+        验收结果 = _打印逐股验收(need, 最新索引, 最近交易日)
+        未完成 = 验收结果[验收结果["status"] == "lagging"].copy()
+
+        for retry_round in range(逐股验收再跑轮数):
+            if 未完成.empty:
+                break
+
+            log(f"\n[补跑] 发现 {len(未完成)} 只股票15分钟仍未追平，立即重跑第 {retry_round + 1} 轮")
+            补跑清洗后, 补跑源端无新增代码 = _补跑滞后股票(最新索引, 未完成.loc[:, ["stock_code", "stock_name"]], 最近交易日)
+            if 补跑清洗后.empty:
+                log("[补跑] 未抓到可补数据")
+                break
+
+            if 补跑源端无新增代码:
+                log(f"  补跑源端无新增股票数: {len(补跑源端无新增代码)}")
+            补跑清洗后, 补跑报告 = 清洗15分钟(补跑清洗后)
+            log(f"  补跑清洗后行数: {len(补跑清洗后):,}")
+            log(f"  补跑清洗修复(all_zero_bar_rows): {补跑报告.get('fixes', {}).get('all_zero_bar_rows', 0):,}")
+
+            _低内存写回15分钟(补跑清洗后)
+            log(f"[OK] 补跑后已重写: {数据15分钟路径}")
+            log("\n[补跑] 同步生成30分钟和60分钟...")
+            增量更新派生分钟数据(补跑清洗后, logger=log)
+
+            最新索引 = _从15分钟文件构建最后日期(数据15分钟路径)
+            need = need.copy()
+            if 补跑源端无新增代码:
+                need = need[~need["stock_code"].isin(补跑源端无新增代码.keys())].copy()
+            验收结果 = _打印逐股验收(need, 最新索引, 最近交易日)
+            未完成 = 验收结果[验收结果["status"] == "lagging"].copy()
+
         if not 未完成.empty:
-            log("[错误] 仍有股票15分钟数据未补齐，视为本次更新失败")
+            log(f"[错误] 仍有股票15分钟数据未补齐，视为本次更新失败")
             log(f"  未补齐股票数: {len(未完成)}")
-            for _, row in 未完成.head(10).iterrows():
+            for _, row in 未完成.iterrows():
                 log(f"    {row['stock_code']}: m15_last={row['m15_last']}")
             raise SystemExit(2)
 

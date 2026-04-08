@@ -28,7 +28,11 @@ def build_prefixes(width: int) -> list[str]:
         return [str(i) for i in range(10)]
     if width == 2:
         return [f"{i:02d}" for i in range(100)]
-    raise ValueError("prefix width must be 1 or 2")
+    if width == 3:
+        return [f"{i:03d}" for i in range(1000)]
+    if width == 4:
+        return [f"{i:04d}" for i in range(10000)]
+    raise ValueError("prefix width must be between 1 and 4")
 
 
 def split_batches(
@@ -78,13 +82,16 @@ def merge_shards(
     total_removed = 0
 
     try:
-        for i, p in enumerate(prefixes, start=1):
+        present_prefixes = sorted([p.name for p in shard_dir.iterdir() if p.is_dir()])
+        merge_prefixes = present_prefixes if present_prefixes else prefixes
+
+        for i, p in enumerate(merge_prefixes, start=1):
             part_dir = shard_dir / p
             files = sorted(part_dir.glob("*.parquet"))
             if not files:
                 continue
 
-            log(f"[2/3] merge shard {i}/{len(prefixes)}: {p} ({len(files)} files)")
+            log(f"[2/3] merge shard {i}/{len(merge_prefixes)}: {p} ({len(files)} files)")
             df = pd.concat([pd.read_parquet(x) for x in files], ignore_index=True)
             before = len(df)
             df = df.drop_duplicates(subset=key_cols, keep="last")
@@ -129,8 +136,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prefix-width",
         type=int,
-        default=2,
-        choices=[1, 2],
+        default=4,
+        choices=[1, 2, 3, 4],
         help="stock_code prefix width for sharding",
     )
     p.add_argument(

@@ -12,6 +12,7 @@ import argparse
 import datetime
 import io
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -41,6 +42,10 @@ BAOSTOCK_LOCK = Path(tempfile.gettempdir()) / "baostock.lock"
 批任务大小 = 80
 最大重试次数 = 3
 重试基础间隔 = 1
+逐股验收再跑轮数 = 1
+最低覆盖率 = 0.5
+最低覆盖股票数 = 1000
+单股查询超时秒数 = 120
 
 
 def _完整交易日截止时间() -> datetime.time:
@@ -49,6 +54,182 @@ def _完整交易日截止时间() -> datetime.time:
         return datetime.time(int(hour_str), int(minute_str))
     except Exception:
         return datetime.time(18, 0)
+
+
+def 规范化查询日期(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        text = str(value).strip()
+        return text[:10] if len(text) >= 10 else None
+    return ts.strftime("%Y-%m-%d")
+
+
+def _打印逐股验收(
+    待更新: pd.DataFrame,
+    更新后最新: pd.DataFrame,
+    最近交易日: str,
+    源端无新增代码: dict[str, str],
+) -> pd.DataFrame:
+    验收 = 待更新.loc[:, ["stock_code", "stock_name"]].merge(
+        更新后最新.loc[:, ["stock_code", "last_date"]],
+        on="stock_code",
+        how="left",
+    )
+    验收["status"] = "ok"
+    no_newer = set(源端无新增代码)
+    lagging_mask = 验收["last_date"].isna() | (验收["last_date"] < 最近交易日)
+    验收.loc[lagging_mask, "status"] = "lagging"
+    # 对已确认“源端无更晚数据”的股票，跳过最终失败判定
+    验收.loc[验收["stock_code"].isin(no_newer), "status"] = "source_no_newer"
+
+    print("\n[验收] 逐股更新结果:")
+    print(f"  待验收股票数: {len(验收)}")
+    print(f"  已到目标交易日: {int((验收['status'] == 'ok').sum())}")
+    print(f"  源端无更晚数据: {int((验收['status'] == 'source_no_newer').sum())}")
+    print(f"  仍落后目标日: {int((验收['status'] == 'lagging').sum())}")
+
+    def _fmt_date(value: object) -> str:
+        return str(value) if pd.notna(value) else "-"
+
+    lagging = 验收[验收["status"] == "lagging"].copy()
+    if not lagging.empty:
+        print("  落后样本（前20）:")
+        for _, row in lagging.head(20).iterrows():
+            print(
+                f"    {row['stock_code']} {row['stock_name']}: "
+                f"last_date={_fmt_date(row['last_date'])} target={最近交易日}"
+            )
+
+    source_no_newer = 验收[验收["status"] == "source_no_newer"].copy()
+    if not source_no_newer.empty:
+        print("  源端无更晚数据样本（前20）:")
+        for _, row in source_no_newer.head(20).iterrows():
+            print(
+                f"    {row['stock_code']} {row['stock_name']}: "
+                f"last_date={_fmt_date(row['last_date'])} target={最近交易日}"
+            )
+
+    return 验收
+
+
+def _检查目标日覆盖率(
+    验收: pd.DataFrame,
+    *,
+    最近交易日: str,
+    总股票数: int,
+) -> None:
+    已到目标日 = int((验收["status"] == "ok").sum())
+    最低需要 = max(最低覆盖股票数, int(总股票数 * 最低覆盖率))
+    if 已到目标日 < 最低需要:
+        print("[错误] 最新交易日覆盖率过低，视为本次更新失败")
+        print(f"  目标日: {最近交易日}")
+        print(f"  已到目标日: {已到目标日}")
+        print(f"  总股票数: {总股票数}")
+        print(f"  最低要求: {最低需要}")
+        raise SystemExit(2)
+
+
+def _按股票代码去重保留最后(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return (
+        df.sort_values(["stock_code", "date"], kind="mergesort")
+        .drop_duplicates(subset=["stock_code", "date"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def _针对滞后股票补跑(
+    合并清洗后: pd.DataFrame,
+    滞后股票: pd.DataFrame,
+    最近交易日: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    if 滞后股票.empty:
+        return 合并清洗后, 滞后股票.copy(), {}
+
+    latest_map = (
+        合并清洗后.groupby("stock_code", as_index=False)["date"]
+        .max()
+        .rename(columns={"date": "last_date"})
+    )
+    latest_map["last_date"] = latest_map["last_date"].map(规范化查询日期)
+    latest_map = latest_map[latest_map["stock_code"].isin(滞后股票["stock_code"].astype(str))].copy()
+    if latest_map.empty:
+        return 合并清洗后, 滞后股票.copy(), {}
+
+    latest_name = (
+        合并清洗后.sort_values(["stock_code", "date"], kind="mergesort")
+        .drop_duplicates(subset=["stock_code"], keep="last")
+        .loc[:, ["stock_code", "stock_name"]]
+    )
+    latest_map = latest_map.merge(latest_name, on="stock_code", how="left")
+
+    lagging_tasks = [
+        {
+            "stock_code": r["stock_code"],
+            "stock_name": r["stock_name"],
+            "last_date": r["last_date"],
+            "start_date": r["last_date"],
+                "end_date": 最近交易日,
+            }
+        for _, r in latest_map.iterrows()
+        if isinstance(r["last_date"], str) and r["last_date"]
+    ]
+    if not lagging_tasks:
+        return 合并清洗后, 滞后股票.copy(), {}
+
+    print(f"\n[补跑] 针对 {len(lagging_tasks)} 只落后股票立即再跑一轮")
+    batches = [lagging_tasks[i : i + 批任务大小] for i in range(0, len(lagging_tasks), 批任务大小)]
+    新数据列表: list[pd.DataFrame] = []
+    失败列表: list[tuple[str, str, str]] = []
+    源端无新增代码: dict[str, str] = {}
+    完成 = 0
+    总任务 = len(lagging_tasks)
+
+    with ProcessPoolExecutor(max_workers=并发数) as ex:
+        fut_map = {ex.submit(_worker_download_batch, batch): batch for batch in batches}
+        for fut in as_completed(fut_map):
+            batch_tasks = fut_map[fut]
+            try:
+                results = fut.result()
+            except Exception as e:
+                for t in batch_tasks:
+                    失败列表.append((t["stock_code"], t["stock_name"], f"batch error: {e}"))
+                    完成 += 1
+                print(f"  [补跑进度] {完成}/{总任务}")
+                continue
+
+            for r in results:
+                完成 += 1
+                code = r["stock_code"]
+                name = r["stock_name"]
+                if not r.get("ok"):
+                    err = r.get("error", "unknown")
+                    if err == "no data":
+                        源端无新增代码[code] = name
+                    else:
+                        失败列表.append((code, name, err))
+                    continue
+
+                t = next((item for item in batch_tasks if item["stock_code"] == code), None)
+                df = BaoStock数据转标准格式(pd.DataFrame(r["rows"], columns=r["fields"]), code, name)
+                last_d = t.get("last_date") if t else None
+                if last_d:
+                    df = df[df["date"] > last_d]
+                if not df.empty:
+                    新数据列表.append(df)
+                else:
+                    源端无新增代码[code] = name
+
+    if 新数据列表:
+        补跑合并 = pd.concat(新数据列表, ignore_index=True)
+        合并清洗后 = pd.concat([合并清洗后, 补跑合并], ignore_index=True)
+        合并清洗后, _ = 清洗日线(合并清洗后)
+    if 失败列表:
+        print(f"  [补跑] 仍有失败股票数: {len(失败列表)}")
+    return 合并清洗后, 滞后股票.copy(), 源端无新增代码
 
 
 def _有效股票代码(series: pd.Series) -> pd.Series:
@@ -122,6 +303,9 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
             for t in tasks
         ]
 
+    def _超时处理(signum, frame):  # noqa: ARG001
+        raise TimeoutError(f"baostock query timed out after {单股查询超时秒数}s")
+
     results: list[dict] = []
     for task in tasks:
         code = task["stock_code"]
@@ -134,9 +318,12 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
         fields = None
         err = None
         bs_code = 代码转BaoStock格式(code)
+        print(f"[worker] query {code} {name} {start_date}->{end_date}", flush=True)
 
         for i in range(最大重试次数):
             try:
+                signal.signal(signal.SIGALRM, _超时处理)
+                signal.alarm(单股查询超时秒数)
                 rs = bs.query_history_k_data_plus(
                     code=bs_code,
                     fields=BAOSTOCK_FIELDS,
@@ -145,6 +332,12 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
                     frequency=频率,
                     adjustflag=复权方式,
                 )
+                if rs is None:
+                    err = "query returned none"
+                    if i < 最大重试次数 - 1:
+                        time.sleep(重试基础间隔 * (2**i))
+                        continue
+                    break
                 if rs.error_code != "0":
                     err = rs.error_msg
                     if "用户未登录" in err:
@@ -165,6 +358,11 @@ def _worker_download_batch(tasks: list[dict]) -> list[dict]:
                 err = str(e)
                 if i < 最大重试次数 - 1:
                     time.sleep(重试基础间隔 * (2**i))
+            finally:
+                try:
+                    signal.alarm(0)
+                except Exception:
+                    pass
 
         if rows:
             results.append(
@@ -285,6 +483,7 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
         )
         股票最新日期 = 按股最后日.merge(最新名称, on="stock_code", how="left")
         股票最新日期 = 股票最新日期[_有效股票代码(股票最新日期["stock_code"])].copy()
+        股票最新日期["last_date"] = 股票最新日期["last_date"].map(规范化查询日期)
 
         print("\n[3/6] 获取最近完整交易日...")
         lg = bs.login()
@@ -340,6 +539,7 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
 
         新数据列表: list[pd.DataFrame] = []
         失败列表: list[tuple[str, str, str]] = []
+        源端无新增代码: dict[str, str] = {}
         完成 = 0
         总任务 = len(tasks)
 
@@ -364,7 +564,9 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
 
                     if not r.get("ok"):
                         err = r.get("error", "unknown")
-                        if err != "no data":
+                        if err == "no data":
+                            源端无新增代码[code] = name
+                        else:
                             失败列表.append((code, name, err))
                         if 完成 % 50 == 0 or 完成 == 总任务:
                             print(f"  进度: {完成}/{总任务}")
@@ -376,14 +578,59 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
                     std = std[_有效股票代码(std["stock_code"])]
                     if not std.empty:
                         新数据列表.append(std)
+                    else:
+                        源端无新增代码[code] = name
 
                     if 完成 % 50 == 0 or 完成 == 总任务:
                         print(f"  进度: {完成}/{总任务}")
 
+        if 失败列表:
+            print(f"\n[重试] {len(失败列表)} 个失败股票串行重试（独立会话）...")
+            still_failed: list[tuple[str, str, str]] = []
+            task_map = {t["stock_code"]: t for t in tasks}
+            for code, name, err_orig in 失败列表:
+                t = task_map.get(code)
+                if t is None:
+                    still_failed.append((code, name, err_orig))
+                    continue
+                retry_results = _worker_download_batch([t])
+                r = retry_results[0] if retry_results else {"ok": False, "error": "retry returned no result"}
+                if not r.get("ok"):
+                    err = r.get("error", "unknown")
+                    if err == "no data":
+                        源端无新增代码[code] = name
+                        continue
+                    still_failed.append((code, name, err))
+                    continue
+
+                raw = pd.DataFrame(r["rows"], columns=r["fields"])
+                std = BaoStock数据转标准格式(raw, code, name)
+                std = std[std["date"] > t["last_date"]]
+                std = std[_有效股票代码(std["stock_code"])]
+                if std.empty:
+                    源端无新增代码[code] = name
+                    continue
+
+                新数据列表.append(std)
+                print(f"    [重试成功] {code}")
+            失败列表 = still_failed
+
         if not 新数据列表:
-            print("\n未获得新增日线数据。")
             if 失败列表:
+                print("\n[错误] 未获得新增日线数据，且仍存在真实失败股票。")
                 print(f"失败股票数: {len(失败列表)}")
+                print("失败样本（前20）:")
+                for code, name, err in 失败列表[:20]:
+                    print(f"    {code} {name}: {err}")
+                if 源端无新增代码:
+                    print(f"源端无新增股票数: {len(源端无新增代码)}")
+                raise SystemExit(2)
+
+            print("\n[提示] 未获得新增日线数据，但滞后股票均已判定为源端无更晚数据。")
+            if 源端无新增代码:
+                print(f"源端无新增股票数: {len(源端无新增代码)}")
+                for code, name in list(源端无新增代码.items())[:20]:
+                    print(f"    {code} {name}")
             return
 
         print("\n[5/6] 合并并清洗结果...")
@@ -414,6 +661,44 @@ def 智能更新(dry_run: bool, limit_stocks: int) -> None:
 
         原子写入Parquet(合并清洗后, 合并数据路径)
         print(f"[OK] 已写回: {合并数据路径}")
+
+        当前合并清洗后 = 合并清洗后
+        验收结果 = pd.DataFrame()
+        for retry_round in range(逐股验收再跑轮数 + 1):
+            更新后最新 = (
+                当前合并清洗后.groupby("stock_code", as_index=False)["date"]
+                .max()
+                .rename(columns={"date": "last_date"})
+            )
+            更新后最新["last_date"] = 更新后最新["last_date"].map(规范化查询日期)
+            验收结果 = _打印逐股验收(需要更新, 更新后最新, 最近交易日, 源端无新增代码)
+            未完成 = 验收结果[验收结果["status"] == "lagging"].copy()
+            if 未完成.empty:
+                break
+            if retry_round >= 逐股验收再跑轮数:
+                break
+
+            print(f"\n[补跑] 发现 {len(未完成)} 只股票未追平，立即重跑第 {retry_round + 1} 轮")
+            当前合并清洗后, _, 补跑源端无新增代码 = _针对滞后股票补跑(
+                当前合并清洗后,
+                未完成.loc[:, ["stock_code", "stock_name"]],
+                最近交易日,
+            )
+            源端无新增代码.update(补跑源端无新增代码)
+            原子写入Parquet(当前合并清洗后, 合并数据路径)
+            print(f"[OK] 补跑后已重写: {合并数据路径}")
+
+        未完成 = 验收结果[验收结果["status"] == "lagging"].copy()
+        if 源端无新增代码:
+            print(f"[提示] 以下股票在源端没有更晚日线，按停牌/退市处理跳过: {len(源端无新增代码)}")
+            for code, name in list(源端无新增代码.items())[:20]:
+                print(f"    {code} {name}")
+        if not 未完成.empty:
+            print("[错误] 写回后仍有股票未补齐到目标交易日，视为本次更新失败")
+            print(f"  未补齐股票数: {len(未完成)}")
+            for _, row in 未完成.head(20).iterrows():
+                print(f"    {row['stock_code']} {row['stock_name']}: last_date={row['last_date']}")
+            raise SystemExit(2)
 
     finally:
         释放BaoStock锁()

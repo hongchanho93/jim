@@ -1,42 +1,194 @@
 {
-  "last_completed_trade_day": "2026-03-17",
-  "last_success_time": "2026-03-17T22:30:05.276778",
+  "last_completed_trade_day": "2026-04-08",
+  "last_success_time": "2026-04-08T19:49:45.160206",
   "last_success_host": "hongjiandeMacBook-Air.local",
   "pipelines": {
     "daily": {
-      "last_trade_day": "2026-03-17",
-      "last_success_time": "2026-03-17T18:00:36.997344",
+      "last_trade_day": "2026-04-08",
+      "last_success_time": "2026-04-08T19:00:26.301352",
       "snapshot": {
         "exists": true,
-        "size": 514410434,
-        "mtime": 1773739874
+        "size": 517979424,
+        "mtime": 1775642424
       }
     },
     "monthly": {
-      "last_month_day": "2026-02-27",
-      "last_success_time": "2026-03-01T18:00:15.024572",
+      "last_month_day": "2026-03-31",
+      "last_success_time": "2026-04-08T19:06:12.515654",
       "snapshot": {
         "exists": true,
-        "size": 30670736,
-        "mtime": 1772369595
-      }
+        "size": 31198146,
+        "mtime": 1775642771
+      },
+      "last_trade_day": "2026-04-08"
     },
     "m15": {
-      "last_trade_day": "2026-03-11",
-      "last_success_time": "2026-03-12T02:06:29.639813",
-      "last_failed_trade_day": "2026-03-17",
-      "last_failure_time": "2026-03-17T18:00:36.997344",
-      "last_failed_snapshot": {
-        "exists": true,
-        "size": 1893181334,
-        "mtime": 1773741971
-      },
+      "last_trade_day": "2026-04-08",
+      "last_success_time": "2026-04-08T19:49:44.828333",
       "snapshot": {
         "exists": true,
-        "size": 1889237664,
-        "mtime": 1773251952
+        "size": 1921801503,
+        "mtime": 1775645309
+      },
+      "source_daily_snapshot": {
+        "exists": true,
+        "size": 517979424,
+        "mtime": 1775642424
+      }
+    },
+    "derived": {
+      "last_trade_day": "2026-04-08",
+      "last_success_time": "2026-04-08T19:49:45.158370",
+      "snapshot": {
+        "source_m15": {
+          "exists": true,
+          "size": 1921801503,
+          "mtime": 1775645309
+        },
+        "target_30": {
+          "exists": true,
+          "size": 1025348034,
+          "mtime": 1775645343
+        },
+        "target_60": {
+          "exists": true,
+          "size": 543309892,
+          "mtime": 1775645357
+        }
+      }
+    },
+    "exrights": {
+      "last_trade_day": "2026-04-08",
+      "last_success_time": "2026-04-08T19:05:48.080228",
+      "snapshot": {
+        "actions": {
+          "exists": true,
+          "size": 282757,
+          "mtime": 1775642747
+        },
+        "shares": {
+          "exists": true,
+          "size": 1202479,
+          "mtime": 1775642748
+        },
+        "summary": {
+          "exists": true,
+          "size": 814,
+          "mtime": 1775642748
+        }
+      }
+    },
+    "index": {
+      "last_trade_day": "2026-04-08",
+      "last_success_time": "2026-04-08T19:00:48.291396",
+      "snapshot": {
+        "daily": {
+          "exists": true,
+          "size": 525623,
+          "mtime": 1775642447
+        },
+        "m15": {
+          "exists": true,
+          "size": 195197,
+          "mtime": 1775642447
+        },
+        "m30": {
+          "exists": true,
+          "size": 198475,
+          "mtime": 1775642447
+        },
+        "m60": {
+          "exists": true,
+          "size": 142995,
+          "mtime": 1775642447
+        },
+        "monthly": {
+          "exists": true,
+          "size": 32533,
+          "mtime": 1775642447
+        }
+      }
+    },
+    "industry": {
+      "last_trade_day": "2026-04-01",
+      "last_success_time": "2026-04-02T02:20:40.518158",
+      "snapshot": {
+        "ths_daily": {
+          "exists": true,
+          "size": 13617858,
+          "mtime": 1775063065
+        },
+        "sw_daily": {
+          "exists": true,
+          "size": 5576624,
+          "mtime": 1775038063
+        },
+        "sw2_daily": {
+          "exists": true,
+          "size": 13766660,
+          "mtime": 1775038356
+        },
+        "sw_constituents": {
+          "exists": true,
+          "size": 120300,
+          "mtime": 1775064040
+        }
+      },
+      "last_failed_trade_day": "2026-04-02",
+      "last_failure_time": "2026-04-03T04:07:34.834777",
+      "last_failed_snapshot": {
+        "ths_daily": {
+          "exists": true,
+          "size": 13625936,
+          "mtime": 1775137050
+        },
+        "sw_daily": {
+          "exists": true,
+          "size": 5576624,
+          "mtime": 1775038063
+        },
+        "sw2_daily": {
+          "exists": true,
+          "size": 13766660,
+          "mtime": 1775038356
+        },
+        "sw_constituents": {
+          "exists": true,
+          "size": 120328,
+          "mtime": 1775156854
+        }
+      }
+    },
+    "ths_cons": {
+      "last_trade_day": "2026-04-01",
+      "last_success_time": "2026-04-02T02:20:48.120296",
+      "snapshot": {
+        "constituents": {
+          "exists": true,
+          "size": 7493,
+          "mtime": 1775064048
+        },
+        "cookie": {
+          "exists": true,
+          "size": 1664,
+          "mtime": 1775022463
+        }
+      },
+      "last_failed_trade_day": "2026-04-02",
+      "last_failure_time": "2026-04-03T14:30:13.414734",
+      "last_failed_snapshot": {
+        "constituents": {
+          "exists": true,
+          "size": 7493,
+          "mtime": 1775192441
+        },
+        "cookie": {
+          "exists": true,
+          "size": 1654,
+          "mtime": 1775142010
+        }
       }
     }
   },
-  "last_completed_month_day": "2026-02-27"
+  "last_completed_month_day": "2026-03-31"
 }
