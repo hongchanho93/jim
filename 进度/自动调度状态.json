@@ -1,6 +1,6 @@
 {
   "last_completed_trade_day": "2026-04-08",
-  "last_success_time": "2026-04-08T19:49:45.160206",
+  "last_success_time": "2026-04-08T22:00:28.377255",
   "last_success_host": "hongjiandeMacBook-Air.local",
   "pipelines": {
     "daily": {
@@ -59,22 +59,22 @@
     },
     "exrights": {
       "last_trade_day": "2026-04-08",
-      "last_success_time": "2026-04-08T19:05:48.080228",
+      "last_success_time": "2026-04-08T21:32:04.953735",
       "snapshot": {
         "actions": {
           "exists": true,
           "size": 282757,
-          "mtime": 1775642747
+          "mtime": 1775651524
         },
         "shares": {
           "exists": true,
-          "size": 1202479,
-          "mtime": 1775642748
+          "size": 1202532,
+          "mtime": 1775651524
         },
         "summary": {
           "exists": true,
           "size": 814,
-          "mtime": 1775642748
+          "mtime": 1775651524
         }
       }
     },
@@ -109,84 +109,13 @@
         }
       }
     },
-    "industry": {
-      "last_trade_day": "2026-04-01",
-      "last_success_time": "2026-04-02T02:20:40.518158",
+    "basic": {
+      "last_trade_day": "2026-04-08",
+      "last_success_time": "2026-04-08T22:00:28.373729",
       "snapshot": {
-        "ths_daily": {
-          "exists": true,
-          "size": 13617858,
-          "mtime": 1775063065
-        },
-        "sw_daily": {
-          "exists": true,
-          "size": 5576624,
-          "mtime": 1775038063
-        },
-        "sw2_daily": {
-          "exists": true,
-          "size": 13766660,
-          "mtime": 1775038356
-        },
-        "sw_constituents": {
-          "exists": true,
-          "size": 120300,
-          "mtime": 1775064040
-        }
-      },
-      "last_failed_trade_day": "2026-04-02",
-      "last_failure_time": "2026-04-03T04:07:34.834777",
-      "last_failed_snapshot": {
-        "ths_daily": {
-          "exists": true,
-          "size": 13625936,
-          "mtime": 1775137050
-        },
-        "sw_daily": {
-          "exists": true,
-          "size": 5576624,
-          "mtime": 1775038063
-        },
-        "sw2_daily": {
-          "exists": true,
-          "size": 13766660,
-          "mtime": 1775038356
-        },
-        "sw_constituents": {
-          "exists": true,
-          "size": 120328,
-          "mtime": 1775156854
-        }
-      }
-    },
-    "ths_cons": {
-      "last_trade_day": "2026-04-01",
-      "last_success_time": "2026-04-02T02:20:48.120296",
-      "snapshot": {
-        "constituents": {
-          "exists": true,
-          "size": 7493,
-          "mtime": 1775064048
-        },
-        "cookie": {
-          "exists": true,
-          "size": 1664,
-          "mtime": 1775022463
-        }
-      },
-      "last_failed_trade_day": "2026-04-02",
-      "last_failure_time": "2026-04-03T14:30:13.414734",
-      "last_failed_snapshot": {
-        "constituents": {
-          "exists": true,
-          "size": 7493,
-          "mtime": 1775192441
-        },
-        "cookie": {
-          "exists": true,
-          "size": 1654,
-          "mtime": 1775142010
-        }
+        "exists": true,
+        "size": 510799,
+        "mtime": 1775653228
       }
     }
   },

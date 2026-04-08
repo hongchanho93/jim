@@ -55293,3 +55293,191 @@ prefix width:2
 [2026-04-08 20:30:09] [SKIP] 15分钟已完成且文件未变更（2026-04-08）
 [2026-04-08 20:30:09] [SKIP] 30/60分钟已完成且文件未变更（2026-04-08）
 [2026-04-08 20:30:09] [SKIP] 本轮无实际更新，已跳过完成通知
+[2026-04-08 21:00:17] [INFO] 触发判断: daily=False index=False exrights=False monthly=False m15=False derived=False (trade_day=2026-04-08, monthly_target_day=2026-04-08, official_month_day=2026-03-31)
+[2026-04-08 21:00:17] [INFO] 文件日期: daily=2026-04-08 index_d=2026-04-08 index_15=2026-04-08 index_30=2026-04-08 index_60=2026-04-08 index_m=2026-04-08 exrights=2026-04-08 monthly=2026-04-08 m15=2026-04-08 m30=2026-04-08 m60=2026-04-08
+[2026-04-08 21:00:17] [SKIP] 日线已完成且文件未变更（2026-04-08）
+[2026-04-08 21:00:17] [SKIP] 上证指数多周期已完成且文件未变更（2026-04-08）
+[2026-04-08 21:00:17] [SKIP] 除权数据已完成且文件未变更（2026-04-08）
+[2026-04-08 21:00:17] [SKIP] 月线已完成且文件未变更（2026-04-08）
+[2026-04-08 21:00:17] [SKIP] 15分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 21:00:17] [SKIP] 30/60分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 21:00:17] [SKIP] 本轮无实际更新，已跳过完成通知
+[2026-04-08 21:15:05] [INFO] 已清理已移除调度管线状态: industry, ths_cons
+[2026-04-08 21:15:05] [INFO] 触发判断: daily=False index=False exrights=False monthly=False m15=False derived=False (trade_day=2026-04-08, monthly_target_day=2026-04-08, official_month_day=2026-03-31)
+[2026-04-08 21:15:05] [INFO] 文件日期: daily=2026-04-08 index_d=2026-04-08 index_15=2026-04-08 index_30=2026-04-08 index_60=2026-04-08 index_m=2026-04-08 exrights=2026-04-08 monthly=2026-04-08 m15=2026-04-08 m30=2026-04-08 m60=2026-04-08
+[2026-04-08 21:15:05] [SKIP] 日线已完成且文件未变更（2026-04-08）
+[2026-04-08 21:15:05] [SKIP] 上证指数多周期已完成且文件未变更（2026-04-08）
+[2026-04-08 21:15:05] [SKIP] 除权数据已完成且文件未变更（2026-04-08）
+[2026-04-08 21:15:05] [SKIP] 月线已完成且文件未变更（2026-04-08）
+[2026-04-08 21:15:05] [SKIP] 15分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 21:15:05] [SKIP] 30/60分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 21:15:05] [SKIP] 本轮无实际更新，已跳过完成通知
+[2026-04-08 21:26:41] [INFO] 触发判断: daily=False index=False exrights=True monthly=False m15=False derived=False (trade_day=2026-04-08, monthly_target_day=2026-04-08, official_month_day=2026-03-31)
+[2026-04-08 21:26:41] [INFO] 文件日期: daily=2026-04-08 index_d=2026-04-08 index_15=2026-04-08 index_30=2026-04-08 index_60=2026-04-08 index_m=2026-04-08 exrights=2026-04-08 monthly=2026-04-08 m15=2026-04-08 m30=2026-04-08 m60=2026-04-08
+[2026-04-08 21:26:41] [SKIP] 日线已完成且文件未变更（2026-04-08）
+[2026-04-08 21:26:41] [SKIP] 上证指数多周期已完成且文件未变更（2026-04-08）
+[2026-04-08 21:26:41] [RUN] 开始执行: 更新除权数据.py
+[universe] loaded 5169 codes
+[warn] skip report 19910630: TypeError("'NoneType' object is not subscriptable")
+[dividend-bulk] processed 20 report dates
+[dividend-bulk] processed 40 report dates
+[dividend-bulk] processed 60 report dates
+[dividend] fallback补数 for 106 bulk-missing codes
+[cninfo-dividend] 100/106
+[cninfo-dividend] 106/106
+Exception ignored while closing generator <generator object _running_event_loop at 0x1581534c0>:
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/site-packages/py_mini_racer/_mini_racer.py", line 368, in _running_event_loop
+    event_loop_thread.join()
+  File "/Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/threading.py", line 1133, in join
+    self._os_thread_handle.join(timeout)
+PythonFinalizationError: cannot join thread at interpreter shutdown
+[ths-dividend] 93/93
+[rights] 100/5169
+[rights] 200/5169
+[rights] 300/5169
+[rights] 400/5169
+[rights] 500/5169
+[rights] 600/5169
+[rights] 700/5169
+[rights] 800/5169
+[rights] 900/5169
+[rights] 1000/5169
+[rights] 1100/5169
+[rights] 1200/5169
+[rights] 1300/5169
+[rights] 1400/5169
+[rights] 1500/5169
+[rights] 1600/5169
+[rights] 1700/5169
+[rights] 1800/5169
+[rights] 1900/5169
+[rights] 2000/5169
+[rights] 2100/5169
+[rights] 2200/5169
+[rights] 2300/5169
+[rights] 2400/5169
+[rights] 2500/5169
+[rights] 2600/5169
+[rights] 2700/5169
+[rights] 2800/5169
+[rights] 2900/5169
+[rights] 3000/5169
+[rights] 3100/5169
+[rights] 3200/5169
+[rights] 3300/5169
+[rights] 3400/5169
+[rights] 3500/5169
+[rights] 3600/5169
+[rights] 3700/5169
+[rights] 3800/5169
+[rights] 3900/5169
+[rights] 4000/5169
+[rights] 4100/5169
+[rights] 4200/5169
+[rights] 4300/5169
+[rights] 4400/5169
+[rights] 4500/5169
+[rights] 4600/5169
+[rights] 4700/5169
+[rights] 4800/5169
+[rights] 4900/5169
+[rights] 5000/5169
+[rights] 5100/5169
+[rights] 5169/5169
+[share-change] using 6 workers
+[share-change] 100/5169
+[share-change] 200/5169
+[share-change] 300/5169
+[share-change] 400/5169
+[share-change] 500/5169
+[share-change] 600/5169
+[share-change] 700/5169
+[2026-04-08 21:30:04] [SKIP] 调度已在运行，跳过本次触发
+[share-change] 800/5169
+[share-change] 900/5169
+[share-change] 1000/5169
+[share-change] 1100/5169
+[share-change] 1200/5169
+[share-change] 1300/5169
+[share-change] 1400/5169
+[share-change] 1500/5169
+[share-change] 1600/5169
+[share-change] 1700/5169
+[share-change] 1800/5169
+[share-change] 1900/5169
+[share-change] 2000/5169
+[share-change] 2100/5169
+[share-change] 2200/5169
+[share-change] 2300/5169
+[share-change] 2400/5169
+[share-change] 2500/5169
+[share-change] 2600/5169
+[share-change] 2700/5169
+[share-change] 2800/5169
+[share-change] 2900/5169
+[share-change] 3000/5169
+[share-change] 3100/5169
+[share-change] 3200/5169
+[share-change] 3300/5169
+[share-change] 3400/5169
+[share-change] 3500/5169
+[share-change] 3600/5169
+[share-change] 3700/5169
+[share-change] 3800/5169
+[share-change] 3900/5169
+[share-change] 4000/5169
+[share-change] 4100/5169
+[share-change] 4200/5169
+[share-change] 4300/5169
+[share-change] 4400/5169
+[share-change] 4500/5169
+[share-change] 4600/5169
+[share-change] 4700/5169
+[share-change] 4800/5169
+[share-change] 4900/5169
+[share-change] 5000/5169
+[share-change] 5100/5169
+[share-change] 5169/5169
+[write] /Users/hongjian/Documents/CODEX项目/股票数据维护/数据/除权数据/corporate_actions.parquet
+[write] /Users/hongjian/Documents/CODEX项目/股票数据维护/数据/除权数据/share_changes.parquet
+[write] /Users/hongjian/Documents/CODEX项目/股票数据维护/数据/除权数据/fetch_summary.json
+[summary]
+  codes=5169
+  total_dividend_events=49499
+  total_rights_events=1016
+  total_share_change_points=123915
+  corporate_actions_output=corporate_actions.parquet
+  share_changes_output=share_changes.parquet
+  elapsed_seconds=323.2
+
+===== START 更新除权数据.py =====
+===== END 更新除权数据.py (exit=0) =====
+
+[2026-04-08 21:32:04] [OK] 执行成功: 更新除权数据.py
+[2026-04-08 21:32:04] [SKIP] 月线已完成且文件未变更（2026-04-08）
+[2026-04-08 21:32:04] [SKIP] 15分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 21:32:04] [SKIP] 30/60分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 21:32:04] [DONE] 自动更新流程完成
+[2026-04-08 22:00:17] [INFO] 触发判断: daily=False basic=True index=False exrights=False monthly=False m15=False derived=False (trade_day=2026-04-08, monthly_target_day=2026-04-08, official_month_day=2026-03-31)
+[2026-04-08 22:00:17] [INFO] 文件日期: daily=2026-04-08 basic=2026-04-08 index_d=2026-04-08 index_15=2026-04-08 index_30=2026-04-08 index_60=2026-04-08 index_m=2026-04-08 exrights=2026-04-08 monthly=2026-04-08 m15=2026-04-08 m30=2026-04-08 m60=2026-04-08
+[2026-04-08 22:00:17] [SKIP] 日线已完成且文件未变更（2026-04-08）
+[2026-04-08 22:00:17] [RUN] 开始执行: 更新基本信息.py
+[start] snapshot_date=2026-04-08
+[universe] codes=5170
+[quote] 1600/5170
+[quote] 3200/5170
+[quote] 4800/5170
+[quote] 5170/5170
+[done] rows=5170 total_market_cap_non_null=5170 float_market_cap_non_null=5170 elapsed=10.4s output=/Users/hongjian/Documents/CODEX项目/股票数据维护/数据/股票基本信息.parquet
+
+===== START 更新基本信息.py =====
+===== END 更新基本信息.py (exit=0) =====
+
+[2026-04-08 22:00:28] [OK] 执行成功: 更新基本信息.py
+[2026-04-08 22:00:28] [SKIP] 上证指数多周期已完成且文件未变更（2026-04-08）
+[2026-04-08 22:00:28] [SKIP] 除权数据已完成且文件未变更（2026-04-08）
+[2026-04-08 22:00:28] [SKIP] 月线已完成且文件未变更（2026-04-08）
+[2026-04-08 22:00:28] [SKIP] 15分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 22:00:28] [SKIP] 30/60分钟已完成且文件未变更（2026-04-08）
+[2026-04-08 22:00:28] [DONE] 自动更新流程完成

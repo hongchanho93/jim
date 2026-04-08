@@ -11,6 +11,7 @@ from 智能更新上证指数 import 转分钟格式 as 上证指数转分钟格
 from 智能更新上证指数 import 聚合日线为月线 as 上证指数聚合月线
 from 自动调度更新 import 分钟线依赖日线已变化
 from 自动调度更新 import 已达到目标日期, 读取Parquet最大日期
+from 更新基本信息 import 整理基本信息快照
 
 
 def test_daily_query_date_normalizes_timestamp_and_datetime_string():
@@ -56,6 +57,64 @@ def test_m15_should_rerun_when_daily_snapshot_changes():
 
     assert 分钟线依赖日线已变化(state, new_daily_snapshot)
     assert not 分钟线依赖日线已变化(state, old_daily_snapshot)
+
+
+def test_basic_snapshot_standardizes_market_cap_fields():
+    raw = pd.DataFrame(
+        [
+            {
+                "stock_code": "000001",
+                "stock_name": "平安银行",
+                "date": "2026-04-08",
+                "close": "10.0",
+                "change_pct": "1.5",
+                "change_amount": "0.15",
+                "volume": "100000",
+                "amount": "1000000",
+                "amplitude": "3.2",
+                "high": "10.2",
+                "low": "9.8",
+                "open": "9.9",
+                "prev_close": "9.85",
+                "turnover": "2.5",
+                "total_market_cap": "200000000000",
+                "float_market_cap": "150000000000",
+                "total_shares": "20000000000",
+                "float_shares": "15000000000",
+            }
+        ]
+    )
+
+    actual = 整理基本信息快照(raw, "2026-04-08")
+
+    assert actual.columns.tolist() == [
+        "stock_code",
+        "stock_name",
+        "date",
+        "close",
+        "change_pct",
+        "change_amount",
+        "volume",
+        "amount",
+        "amplitude",
+        "high",
+        "low",
+        "open",
+        "prev_close",
+        "turnover",
+        "total_market_cap",
+        "float_market_cap",
+        "total_shares",
+        "float_shares",
+    ]
+    row = actual.iloc[0]
+    assert row["stock_code"] == "000001"
+    assert row["stock_name"] == "平安银行"
+    assert row["date"] == "2026-04-08"
+    assert row["total_market_cap"] == 200000000000
+    assert row["float_market_cap"] == 150000000000
+    assert row["total_shares"] == 20000000000
+    assert row["float_shares"] == 15000000000
 
 
 def test_index_daily_update_standardizes_baostock_rows():

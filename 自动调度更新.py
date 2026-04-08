@@ -1,12 +1,12 @@
-"""自动调度更新（日线 + 上证指数多周期 + 除权缓存 + 月线 + 15分钟 + 30/60分钟派生 + 申万行业数据）。
+"""自动调度更新（日线 + 基本信息 + 上证指数多周期 + 除权缓存 + 月线 + 15分钟 + 30/60分钟派生）。
 
 策略：
 - 18:00后按最新完整交易日执行。
 - 若错过18:00，后续触发会自动补跑未完成交易日/月或文件修复任务。
 - 触发条件 = 目标交易/月份未完成 或 数据文件快照变化。
-- 顺序执行：日线 -> 上证指数多周期 -> 除权缓存 -> 月线 -> 15分钟 -> 30/60分钟派生。
+- 顺序执行：日线 -> 基本信息 -> 上证指数多周期 -> 除权缓存 -> 月线 -> 15分钟 -> 30/60分钟派生。
 - 月线文件始终补到最新日线日期：已完成月份走BaoStock，当前月用日线聚合临时月K。
-- 行业/板块数据仅保留申万链路，放在核心价格链路之后执行。
+- 当前自动调度仅覆盖核心行情链路；行业/板块数据需单独手动更新。
 """
 
 from __future__ import annotations
@@ -14,9 +14,12 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import baostock as bs
@@ -39,6 +42,7 @@ from 配置月线 import 数据月线路径
 上证指数30分钟路径 = 项目目录 / "数据" / "上证指数30分钟数据.parquet"
 上证指数60分钟路径 = 项目目录 / "数据" / "上证指数60分钟数据.parquet"
 上证指数月线路径 = 项目目录 / "数据" / "上证指数月线数据.parquet"
+股票基本信息路径 = 项目目录 / "数据" / "股票基本信息.parquet"
 申万行业日线路径 = 项目目录 / "数据" / "申万行业日线数据.parquet"
 申万二级行业日线路径 = 项目目录 / "数据" / "申万二级行业日线数据.parquet"
 申万行业成分股路径 = 项目目录 / "数据" / "申万行业成分股.parquet"
@@ -47,6 +51,20 @@ from 配置月线 import 数据月线路径
 默认触发分钟 = 0
 
 调度锁 = Path(tempfile.gettempdir()) / "stock_auto_scheduler.lock"
+默认子脚本超时秒数 = 2 * 60 * 60
+脚本超时秒数 = {
+    "智能更新.py": 4 * 60 * 60,
+    "更新基本信息.py": 30 * 60,
+    "智能更新上证指数.py": 60 * 60,
+    "更新除权数据.py": 2 * 60 * 60,
+    "智能更新月线.py": 2 * 60 * 60,
+    "智能更新15分钟.py": 4 * 60 * 60,
+    "派生分钟数据.py": 2 * 60 * 60,
+}
+调度锁无PID过期秒数 = 24 * 60 * 60
+交易日查询超时秒数 = 60
+读取Parquet最大日期超时秒数 = 120
+已移除调度管线 = ("industry", "ths_cons")
 
 
 def log(msg: str) -> None:
@@ -63,9 +81,39 @@ def 通知(title: str, message: str) -> None:
     safe_message = message.replace('"', '\\"')
     script = f'display notification "{safe_message}" with title "{safe_title}"'
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    except Exception:
-        pass
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            log(f"[WARN] 通知发送失败: exit={result.returncode} stderr={stderr or '-'}")
+    except Exception as exc:
+        log(f"[WARN] 通知发送异常: {exc!r}")
+
+
+def _信号超时处理(signum, frame):  # noqa: ARG001
+    raise TimeoutError("operation timed out")
+
+
+@contextmanager
+def 超时保护(seconds: int, *, label: str):
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _信号超时处理)
+    signal.alarm(seconds)
+    try:
+        yield
+    except TimeoutError as exc:
+        raise TimeoutError(f"{label} timed out after {seconds}s") from exc
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def 读取状态() -> dict:
@@ -79,7 +127,13 @@ def 读取状态() -> dict:
 
 def 保存状态(data: dict) -> None:
     状态文件.parent.mkdir(parents=True, exist_ok=True)
-    状态文件.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp_path = 状态文件.with_suffix(状态文件.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, 状态文件)
 
 
 def 文件快照(path: Path) -> dict:
@@ -146,37 +200,41 @@ def 读取Parquet最大日期(path: Path) -> str | None:
         return None
 
     try:
-        pf = pq.ParquetFile(path)
-    except Exception:
-        return None
+        with 超时保护(读取Parquet最大日期超时秒数, label=f"read parquet max date: {path.name}"):
+            try:
+                pf = pq.ParquetFile(path)
+            except Exception:
+                return None
 
-    names = pf.metadata.schema.names
-    if "date" not in names:
-        return None
+            names = pf.metadata.schema.names
+            if "date" not in names:
+                return None
 
-    date_idx = names.index("date")
-    max_date = None
-    saw_stats = False
+            date_idx = names.index("date")
+            max_date = None
+            saw_stats = False
 
-    for i in range(pf.metadata.num_row_groups):
-        stats = pf.metadata.row_group(i).column(date_idx).statistics
-        if stats is None or stats.max is None:
-            continue
-        saw_stats = True
-        candidate = _格式化日期值(stats.max)
-        if candidate and (max_date is None or candidate > max_date):
-            max_date = candidate
+            for i in range(pf.metadata.num_row_groups):
+                stats = pf.metadata.row_group(i).column(date_idx).statistics
+                if stats is None or stats.max is None:
+                    continue
+                saw_stats = True
+                candidate = _格式化日期值(stats.max)
+                if candidate and (max_date is None or candidate > max_date):
+                    max_date = candidate
 
-    if max_date is not None or saw_stats:
-        return max_date
+            if max_date is not None or saw_stats:
+                return max_date
 
-    for rb in pf.iter_batches(columns=["date"], batch_size=500_000):
-        col = rb.column(0)
-        for item in col.to_pylist():
-            candidate = _格式化日期值(item)
-            if candidate and (max_date is None or candidate > max_date):
-                max_date = candidate
-    return max_date
+            for rb in pf.iter_batches(columns=["date"], batch_size=500_000):
+                col = rb.column(0)
+                for item in col.to_pylist():
+                    candidate = _格式化日期值(item)
+                    if candidate and (max_date is None or candidate > max_date):
+                        max_date = candidate
+            return max_date
+    except TimeoutError as exc:
+        raise RuntimeError(f"读取Parquet最大日期超时: {path}") from exc
 
 
 def 读取除权缓存日期(summary_path: Path) -> str | None:
@@ -222,6 +280,13 @@ def _同交易日失败且快照未变(state: dict, trade_day: str, snap_now: di
     )
 
 
+def _分钟线失败快照(m15_snapshot: dict, daily_snapshot: dict) -> dict:
+    return {
+        "m15": m15_snapshot,
+        "source_daily": daily_snapshot,
+    }
+
+
 def 获取执行截止时间() -> datetime.time:
     try:
         hour_str, minute_str = 执行时间.split(":")
@@ -240,12 +305,13 @@ def 获取最近完整交易日(*, 截止前排除当日: bool = True) -> str | 
     start = (today - datetime.timedelta(days=40)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
 
-    rs = bs.query_trade_dates(start_date=start, end_date=end)
     trades: list[str] = []
-    while rs.next():
-        d, is_trade = rs.get_row_data()
-        if is_trade == "1":
-            trades.append(d)
+    with 超时保护(交易日查询超时秒数, label="query_trade_dates"):
+        rs = bs.query_trade_dates(start_date=start, end_date=end)
+        while rs.next():
+            d, is_trade = rs.get_row_data()
+            if is_trade == "1":
+                trades.append(d)
 
     if not trades:
         return None
@@ -266,12 +332,13 @@ def 获取最近完整月份交易日() -> str | None:
     start = (prev_month_end - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
     end = prev_month_end.strftime("%Y-%m-%d")
 
-    rs = bs.query_trade_dates(start_date=start, end_date=end)
     trades: list[str] = []
-    while rs.next():
-        d, is_trade = rs.get_row_data()
-        if is_trade == "1" and d <= end:
-            trades.append(d)
+    with 超时保护(交易日查询超时秒数, label="query_trade_dates(monthly)"):
+        rs = bs.query_trade_dates(start_date=start, end_date=end)
+        while rs.next():
+            d, is_trade = rs.get_row_data()
+            if is_trade == "1" and d <= end:
+                trades.append(d)
 
     if not trades:
         return None
@@ -284,16 +351,23 @@ def 运行脚本(script_name: str) -> bool:
         log(f"[ERROR] 脚本不存在: {script_path}")
         return False
 
+    timeout_seconds = 脚本超时秒数.get(script_name, 默认子脚本超时秒数)
     log(f"[RUN] 开始执行: {script_name}")
     with open(日志文件, "a", encoding="utf-8") as f:
         f.write(f"\n===== START {script_name} =====\n")
-        result = subprocess.run(
-            [sys.executable, str(script_path)],
-            cwd=项目目录,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=项目目录,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            f.write(f"===== END {script_name} (timeout={timeout_seconds}) =====\n\n")
+            log(f"[ERROR] 执行超时: {script_name}, timeout={timeout_seconds}s")
+            return False
         f.write(f"===== END {script_name} (exit={result.returncode}) =====\n\n")
 
     if result.returncode == 0:
@@ -305,13 +379,16 @@ def 运行脚本(script_name: str) -> bool:
 
 
 def 获取调度锁() -> bool:
-    try:
-        fd = os.open(str(调度锁), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
+    for _ in range(2):
+        try:
+            fd = os.open(str(调度锁), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if not _清理失效调度锁():
+                return False
+    return False
 
 
 def 释放调度锁() -> None:
@@ -320,6 +397,56 @@ def 释放调度锁() -> None:
             调度锁.unlink()
         except Exception:
             pass
+
+
+def _读取锁内PID(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _进程仍在运行(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
+def _清理失效调度锁() -> bool:
+    if not 调度锁.exists():
+        return True
+
+    pid = _读取锁内PID(调度锁)
+    if pid is not None:
+        if _进程仍在运行(pid):
+            return False
+        try:
+            调度锁.unlink()
+            log(f"[WARN] 已清理失效调度锁（PID不存在）: pid={pid}")
+            return True
+        except Exception:
+            return False
+
+    try:
+        age = time.time() - 调度锁.stat().st_mtime
+    except FileNotFoundError:
+        return True
+
+    if age < 调度锁无PID过期秒数:
+        return False
+
+    try:
+        调度锁.unlink()
+        log(f"[WARN] 已清理失效调度锁（无PID且已过期）: age={int(age)}s")
+        return True
+    except Exception:
+        return False
 
 
 def _管道状态(state: dict, name: str) -> dict:
@@ -343,6 +470,16 @@ def _清理失败状态(pipe_state: dict) -> None:
     pipe_state.pop("last_failed_snapshot", None)
 
 
+def _清理已移除管线状态(state: dict) -> list[str]:
+    pipelines = state.setdefault("pipelines", {})
+    removed: list[str] = []
+    for name in 已移除调度管线:
+        if name in pipelines:
+            pipelines.pop(name, None)
+            removed.append(name)
+    return removed
+
+
 def _应继续修复当日(current_trade_day: str | None, fallback_trade_day: str | None, state: dict, observed_dates: list[str | None]) -> bool:
     if not current_trade_day or not fallback_trade_day or current_trade_day == fallback_trade_day:
         return False
@@ -351,7 +488,7 @@ def _应继续修复当日(current_trade_day: str | None, fallback_trade_day: st
         return True
 
     pipelines = state.get("pipelines", {})
-    for name in ("daily", "index", "exrights", "monthly", "m15", "industry"):
+    for name in ("daily", "basic", "index", "exrights", "monthly", "m15", "derived"):
         pipe_state = pipelines.get(name, {})
         if pipe_state.get("last_trade_day") == current_trade_day:
             return True
@@ -391,7 +528,12 @@ def main() -> int:
             return 1
 
         state = 读取状态()
+        removed_pipelines = _清理已移除管线状态(state)
+        if removed_pipelines:
+            log(f"[INFO] 已清理已移除调度管线状态: {', '.join(removed_pipelines)}")
+            保存状态(state)
         daily_snap_now = 文件快照(合并数据路径)
+        basic_snap_now = 文件快照(股票基本信息路径)
         index_snap_now = {
             "daily": 文件快照(上证指数日线路径),
             "m15": 文件快照(上证指数15分钟路径),
@@ -403,6 +545,7 @@ def main() -> int:
         m15_snap_now = 文件快照(数据15分钟路径)
         exrights_snap_now = 除权缓存快照()
         daily_max_now = 读取Parquet最大日期(合并数据路径)
+        basic_max_now = 读取Parquet最大日期(股票基本信息路径)
         index_max_now = {
             "daily": 读取Parquet最大日期(上证指数日线路径),
             "m15": 读取Parquet最大日期(上证指数15分钟路径),
@@ -422,6 +565,7 @@ def main() -> int:
             state,
             [
                 daily_max_now,
+                basic_max_now,
                 monthly_max_now,
                 m15_max_now,
                 exrights_generated_day,
@@ -435,6 +579,7 @@ def main() -> int:
 
         monthly_target_day = trade_day
         daily_fresh = 已达到目标日期(daily_max_now, trade_day)
+        basic_fresh = 已达到目标日期(basic_max_now, trade_day)
         index_fresh = all(已达到目标日期(v, trade_day) for v in index_max_now.values())
         exrights_fresh = 已达到目标日期(exrights_generated_day, trade_day)
         monthly_fresh = 已达到目标日期(monthly_max_now, monthly_target_day)
@@ -442,6 +587,7 @@ def main() -> int:
         derived_fresh = 已达到目标日期(derived_30_max_now, trade_day) and 已达到目标日期(derived_60_max_now, trade_day)
 
         daily_state = _管道状态(state, "daily")
+        basic_state = _管道状态(state, "basic")
         index_state = _管道状态(state, "index")
         exrights_state = _管道状态(state, "exrights")
         monthly_state = _管道状态(state, "monthly")
@@ -449,6 +595,7 @@ def main() -> int:
         derived_state = _管道状态(state, "derived")
 
         need_daily = (daily_state.get("last_trade_day") != trade_day) or 快照变化(daily_state.get("snapshot"), daily_snap_now) or (not daily_fresh)
+        need_basic = (basic_state.get("last_trade_day") != trade_day) or 快照变化(basic_state.get("snapshot"), basic_snap_now) or (not basic_fresh)
         need_index = (index_state.get("last_trade_day") != trade_day) or 快照变化(index_state.get("snapshot"), index_snap_now) or (not index_fresh)
         need_exrights = (exrights_state.get("last_trade_day") != trade_day) or 快照变化(exrights_state.get("snapshot"), exrights_snap_now) or (not exrights_fresh)
         need_monthly = (monthly_state.get("last_trade_day") != monthly_target_day) or 快照变化(monthly_state.get("snapshot"), monthly_snap_now) or (not monthly_fresh)
@@ -458,8 +605,6 @@ def main() -> int:
             or (not m15_fresh)
             or 分钟线依赖日线已变化(m15_state, daily_snap_now)
         )
-        if need_m15 and _同交易日失败且快照未变(m15_state, trade_day, m15_snap_now):
-            log(f"[INFO] 15分钟在当前交易日已失败且文件未变化（{trade_day}），本轮继续重试")
 
         m15_ready_for_derived = m15_state.get("last_trade_day") == trade_day and m15_fresh
         derived_snapshot_now = {
@@ -475,12 +620,13 @@ def main() -> int:
 
         log(
             "[INFO] 触发判断: "
-            f"daily={need_daily} index={need_index} exrights={need_exrights} monthly={need_monthly} m15={need_m15} derived={need_derived} "
+            f"daily={need_daily} basic={need_basic} index={need_index} exrights={need_exrights} monthly={need_monthly} m15={need_m15} derived={need_derived} "
             f"(trade_day={trade_day}, monthly_target_day={monthly_target_day}, official_month_day={month_day})"
         )
         log(
             "[INFO] 文件日期: "
             f"daily={daily_max_now or '-'} "
+            f"basic={basic_max_now or '-'} "
             f"index_d={index_max_now['daily'] or '-'} index_15={index_max_now['m15'] or '-'} "
             f"index_30={index_max_now['m30'] or '-'} index_60={index_max_now['m60'] or '-'} "
             f"index_m={index_max_now['monthly'] or '-'} exrights={exrights_generated_day or '-'} monthly={monthly_max_now or '-'} "
@@ -488,7 +634,7 @@ def main() -> int:
         )
 
         if not 现在是否已到截止时间():
-            if not (need_daily or need_index or need_exrights or need_monthly or need_m15 or need_derived):
+            if not (need_daily or need_basic or need_index or need_exrights or need_monthly or need_m15 or need_derived):
                 log(f"[SKIP] 当前时间早于{执行时间}，且无待补跑/修复任务")
                 return 0
             log(f"[INFO] 当前时间早于{执行时间}，检测到待补跑/修复任务，继续执行")
@@ -524,6 +670,36 @@ def main() -> int:
             保存状态(state)
         else:
             log(f"[SKIP] 日线已完成且文件未变更（{trade_day}）")
+
+        if need_basic:
+            if not 运行脚本("更新基本信息.py"):
+                _记录失败状态(basic_state, trade_day, 文件快照(股票基本信息路径))
+                保存状态(state)
+                通知("股票自动更新失败", f"基本信息更新失败（{trade_day}）")
+                return 1
+            did_run_any = True
+            basic_success_time = datetime.datetime.now().isoformat()
+            basic_snap_after = 文件快照(股票基本信息路径)
+            basic_max_after = 读取Parquet最大日期(股票基本信息路径)
+            if not 已达到目标日期(basic_max_after, trade_day):
+                _记录失败状态(basic_state, trade_day, basic_snap_after)
+                保存状态(state)
+                log(f"[ERROR] 基本信息脚本返回成功，但文件最大日期仍为 {basic_max_after or '-'}，目标 {trade_day}")
+                通知("股票自动更新失败", f"基本信息文件未更新到目标交易日（{trade_day}）")
+                return 1
+            basic_state.update(
+                {
+                    "last_trade_day": trade_day,
+                    "last_success_time": basic_success_time,
+                    "snapshot": basic_snap_after,
+                }
+            )
+            basic_snap_now = basic_snap_after
+            basic_max_now = basic_max_after
+            _清理失败状态(basic_state)
+            保存状态(state)
+        else:
+            log(f"[SKIP] 基本信息已完成且文件未变更（{trade_day}）")
 
         if need_index:
             if not 运行脚本("智能更新上证指数.py"):
@@ -566,6 +742,8 @@ def main() -> int:
                     "snapshot": index_snap_after,
                 }
             )
+            index_snap_now = index_snap_after
+            index_max_now = index_max_after
             _清理失败状态(index_state)
             保存状态(state)
         else:
@@ -596,6 +774,8 @@ def main() -> int:
                     "snapshot": exrights_snap_after,
                 }
             )
+            exrights_snap_now = exrights_snap_after
+            exrights_generated_day = exrights_generated_after
             _清理失败状态(exrights_state)
             保存状态(state)
         else:
@@ -625,14 +805,42 @@ def main() -> int:
                     "snapshot": monthly_snap_after,
                 }
             )
+            monthly_snap_now = monthly_snap_after
+            monthly_max_now = monthly_max_after
             _清理失败状态(monthly_state)
             保存状态(state)
         else:
             log(f"[SKIP] 月线已完成且文件未变更（{monthly_target_day}）")
 
+        m15_snap_now = 文件快照(数据15分钟路径)
+        m15_max_now = 读取Parquet最大日期(数据15分钟路径)
+        m15_fresh = 已达到目标日期(m15_max_now, trade_day)
+        m15_failure_snapshot_now = _分钟线失败快照(m15_snap_now, daily_snap_now)
+        need_m15 = (
+            (m15_state.get("last_trade_day") != trade_day)
+            or 快照变化(m15_state.get("snapshot"), m15_snap_now)
+            or (not m15_fresh)
+            or 分钟线依赖日线已变化(m15_state, daily_snap_now)
+        )
+        if need_m15 and _同交易日失败且快照未变(m15_state, trade_day, m15_failure_snapshot_now):
+            need_m15 = False
+            log(f"[SKIP] 15分钟在当前交易日已失败且输入未变化（{trade_day}），跳过重复重试")
+
+        m15_ready_for_derived = m15_state.get("last_trade_day") == trade_day and m15_fresh
+        derived_snapshot_now = {
+            "source_m15": m15_snap_now,
+            "target_30": 文件快照(项目目录 / "数据" / "全市场30分钟数据.parquet"),
+            "target_60": 文件快照(项目目录 / "数据" / "全市场60分钟数据.parquet"),
+        }
+        need_derived = m15_ready_for_derived and (
+            derived_state.get("last_trade_day") != trade_day
+            or 快照变化(derived_state.get("snapshot"), derived_snapshot_now)
+            or (not derived_fresh)
+        )
+
         if need_m15:
             if not 运行脚本("智能更新15分钟.py"):
-                _记录失败状态(m15_state, trade_day, 文件快照(数据15分钟路径))
+                _记录失败状态(m15_state, trade_day, m15_failure_snapshot_now)
                 保存状态(state)
                 通知("股票自动更新失败", f"15分钟更新失败（{trade_day}）")
                 return 1
@@ -654,6 +862,8 @@ def main() -> int:
                     "source_daily_snapshot": daily_snap_now,
                 }
             )
+            m15_snap_now = m15_snap_after
+            m15_max_now = m15_max_after
             _清理失败状态(m15_state)
             保存状态(state)
             m15_ready_for_derived = True
@@ -700,6 +910,8 @@ def main() -> int:
                     },
                 }
             )
+            derived_30_max_now = derived_30_max_after
+            derived_60_max_now = derived_60_max_after
             _清理失败状态(derived_state)
             保存状态(state)
         else:
@@ -708,7 +920,22 @@ def main() -> int:
             else:
                 log(f"[SKIP] 30/60分钟已完成且文件未变更（{trade_day}）")
 
+        核心管线已完成 = (
+            已达到目标日期(daily_max_now, trade_day)
+            and 已达到目标日期(basic_max_now, trade_day)
+            and all(已达到目标日期(v, trade_day) for v in index_max_now.values())
+            and 已达到目标日期(exrights_generated_day, trade_day)
+            and 已达到目标日期(monthly_max_now, monthly_target_day)
+            and 已达到目标日期(m15_max_now, trade_day)
+            and 已达到目标日期(derived_30_max_now, trade_day)
+            and 已达到目标日期(derived_60_max_now, trade_day)
+        )
+
         if did_run_any:
+            if not 核心管线已完成:
+                log("[ERROR] 本轮执行后仍有核心管线未完成，不记录整体完成")
+                通知("股票自动更新失败", f"本轮执行后仍有核心管线未完成（{trade_day}）")
+                return 1
             final_success_time = datetime.datetime.now().isoformat()
             state.update(
                 {
@@ -720,7 +947,7 @@ def main() -> int:
             )
             保存状态(state)
             log("[DONE] 自动更新流程完成")
-            通知("股票自动更新完成", f"已完成日线+上证指数多周期+除权+月线+15/30/60分钟+申万数据更新（{trade_day} / {month_day}）")
+            通知("股票自动更新完成", f"已完成日线+基本信息+上证指数多周期+除权+月线+15/30/60分钟更新（{trade_day} / {month_day}）")
         else:
             log("[SKIP] 本轮无实际更新，已跳过完成通知")
         return 0

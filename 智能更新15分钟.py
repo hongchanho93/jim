@@ -383,6 +383,66 @@ def _硬链接或复制(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _写入临时增量批次(batch_dir: Path, batch_idx: int, frames: list[pd.DataFrame]) -> int:
+    if not frames:
+        return batch_idx
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    out = pd.concat(frames, ignore_index=True)
+    out.to_parquet(batch_dir / f"batch_{batch_idx:06d}.parquet", engine="pyarrow", compression="snappy", index=False)
+    return batch_idx + 1
+
+
+def _清洗并写入临时增量批次(
+    batch_dir: Path,
+    batch_idx: int,
+    frames: list[pd.DataFrame],
+) -> tuple[int, dict[str, object]]:
+    if not frames:
+        return batch_idx, {"raw_rows": 0, "clean_rows": 0, "all_zero_bar_rows": 0, "stock_codes": set()}
+
+    raw_df = pd.concat(frames, ignore_index=True)
+    cleaned_df, report = 清洗15分钟(raw_df)
+    if cleaned_df.empty:
+        return batch_idx, {
+            "raw_rows": len(raw_df),
+            "clean_rows": 0,
+            "all_zero_bar_rows": int(report.get("fixes", {}).get("all_zero_bar_rows", 0)),
+            "stock_codes": set(),
+        }
+
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    cleaned_df.to_parquet(batch_dir / f"batch_{batch_idx:06d}.parquet", engine="pyarrow", compression="snappy", index=False)
+    return batch_idx + 1, {
+        "raw_rows": len(raw_df),
+        "clean_rows": len(cleaned_df),
+        "all_zero_bar_rows": int(report.get("fixes", {}).get("all_zero_bar_rows", 0)),
+        "stock_codes": set(cleaned_df["stock_code"].astype(str).unique().tolist()),
+    }
+
+
+def _写回暂存批次到15分钟(staged_files: list[Path]) -> None:
+    temp_root = Path(tempfile.gettempdir()) / f"m15_increment_{int(time.time())}"
+    batch_dir = temp_root / "batches"
+    work_dir = temp_root / "work"
+    output_file = temp_root / "merged.parquet"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _硬链接或复制(数据15分钟路径, batch_dir / "batch_000000.parquet")
+        for idx, src in enumerate(staged_files, start=1):
+            _硬链接或复制(src, batch_dir / f"batch_{idx:06d}.parquet")
+
+        _调用低内存合并(batch_dir=batch_dir, output=output_file, work_dir=work_dir)
+
+        target_tmp = 数据15分钟路径.with_suffix(数据15分钟路径.suffix + ".tmp")
+        if target_tmp.exists():
+            target_tmp.unlink()
+        shutil.move(str(output_file), str(target_tmp))
+        target_tmp.replace(数据15分钟路径)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="15分钟智能增量更新")
     p.add_argument("--dry-run", action="store_true", help="只下载与校验，不写回文件")
@@ -617,126 +677,130 @@ def main() -> None:
                 }
             )
 
-        新增列表: list[pd.DataFrame] = []
+        temp_download_root = Path(tempfile.gettempdir()) / f"m15_download_{int(time.time())}"
+        staged_batch_dir = temp_download_root / "batches"
+        staged_batch_idx = 0
         失败列表: list[tuple[str, str]] = []
         done = 0
-
-        batches = [tasks[i : i + 批任务大小] for i in range(0, len(tasks), 批任务大小)]
-        with ProcessPoolExecutor(max_workers=并发进程数) as ex:
-            fut_map = {ex.submit(_worker_download_batch, batch): batch for batch in batches}
-            for fut in as_completed(fut_map):
-                batch_tasks = fut_map[fut]
-                try:
-                    results = fut.result()
-                except Exception as e:
-                    for t in batch_tasks:
-                        失败列表.append((t["stock_code"], f"batch error: {e}"))
-                        done += 1
-                    log(f"  进度: {done}/{len(tasks)}")
-                    continue
-
-                for r in results:
-                    done += 1
-                    code = r["stock_code"]
-                    if not r.get("ok"):
-                        err = r.get("error", "unknown")
-                        if err != "no data":
-                            失败列表.append((code, err))
-                        if done % 50 == 0 or done == len(tasks):
-                            log(f"  进度: {done}/{len(tasks)}")
-                        continue
-
-                    t = next((item for item in batch_tasks if item["stock_code"] == code), None)
-                    df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
-                    last_d = t.get("last_date") if t else None
-                    if last_d:
-                        df = df[df["date"] >= last_d]
-                    if not df.empty:
-                        新增列表.append(df)
-
-                    if done % 50 == 0 or done == len(tasks):
-                        log(f"  进度: {done}/{len(tasks)}")
-
-        # 对失败的股票串行重试（独立BaoStock会话，避免并发连接争用）
-        if 失败列表:
-            log(f"\n[重试] {len(失败列表)} 个失败股票串行重试（独立会话）...")
-            still_失败: list[tuple[str, str]] = []
-            task_map = {t["stock_code"]: t for t in tasks}
-            for code, err_orig in 失败列表:
-                t = task_map.get(code)
-                if t is None:
-                    still_失败.append((code, err_orig))
-                    continue
-                retry_results = _worker_download_batch([t])
-                r = retry_results[0] if retry_results else {"ok": False, "error": "retry returned no result"}
-                if r.get("ok"):
-                    df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
-                    last_d = t.get("last_date")
-                    if last_d:
-                        df = df[df["date"] >= last_d]
-                    if not df.empty:
-                        新增列表.append(df)
-                    log(f"    [重试成功] {code}")
-                else:
-                    still_失败.append((code, r.get("error", "unknown")))
-            失败列表 = still_失败
-            if 失败列表:
-                log(f"  重试后仍失败: {len(失败列表)}")
-            else:
-                log("  所有失败股票重试成功")
-
-        if not 新增列表:
-            if 失败列表:
-                log("\n[错误] 未下载到新增15分钟数据，且仍存在真实失败股票。")
-                log(f"失败股票数: {len(失败列表)}")
-                log("失败样本（前10）:")
-                for code, err in 失败列表[:10]:
-                    log(f"    {code}: {err}")
-                raise SystemExit(2)
-
-            log("\n[提示] 未下载到新增15分钟数据，但滞后股票均已判定为源端无更晚数据。")
-            return
-
-        log("\n[6/7] 清洗新增数据...")
-        新增合并 = pd.concat(新增列表, ignore_index=True)
-        新增清洗后, 新增报告 = 清洗15分钟(新增合并)
-        log(f"  新增原始行数: {len(新增合并):,}")
-        log(f"  新增清洗后行数: {len(新增清洗后):,}")
-        log(f"  新增清洗后股票数: {新增清洗后['stock_code'].nunique():,}")
-        log(f"  清洗修复(all_zero_bar_rows): {新增报告.get('fixes', {}).get('all_zero_bar_rows', 0):,}")
-
-        if args.dry_run:
-            log("\n[DRY-RUN] 不写回15分钟文件")
-            log(f"  失败股票数: {len(失败列表)}")
-            return
-
-        log("\n[7/7] 低内存合并并写回...")
-        temp_root = Path(tempfile.gettempdir()) / f"m15_increment_{int(time.time())}"
-        batch_dir = temp_root / "batches"
-        work_dir = temp_root / "work"
-        output_file = temp_root / "merged.parquet"
-        batch_dir.mkdir(parents=True, exist_ok=True)
+        新增原始行数 = 0
+        新增清洗后行数 = 0
+        清洗修复_all_zero = 0
+        新增股票集合: set[str] = set()
 
         try:
-            _硬链接或复制(数据15分钟路径, batch_dir / "batch_000000.parquet")
-            新增清洗后.to_parquet(batch_dir / "batch_000001.parquet", engine="pyarrow", compression="snappy", index=False)
+            batches = [tasks[i : i + 批任务大小] for i in range(0, len(tasks), 批任务大小)]
+            with ProcessPoolExecutor(max_workers=并发进程数) as ex:
+                fut_map = {ex.submit(_worker_download_batch, batch): batch for batch in batches}
+                for fut in as_completed(fut_map):
+                    batch_tasks = fut_map[fut]
+                    batch_frames: list[pd.DataFrame] = []
+                    try:
+                        results = fut.result()
+                    except Exception as e:
+                        for t in batch_tasks:
+                            失败列表.append((t["stock_code"], f"batch error: {e}"))
+                            done += 1
+                        log(f"  进度: {done}/{len(tasks)}")
+                        continue
 
-            _调用低内存合并(batch_dir=batch_dir, output=output_file, work_dir=work_dir)
+                    for r in results:
+                        done += 1
+                        code = r["stock_code"]
+                        if not r.get("ok"):
+                            err = r.get("error", "unknown")
+                            if err != "no data":
+                                失败列表.append((code, err))
+                            if done % 50 == 0 or done == len(tasks):
+                                log(f"  进度: {done}/{len(tasks)}")
+                            continue
 
-            target_tmp = 数据15分钟路径.with_suffix(数据15分钟路径.suffix + ".tmp")
-            if target_tmp.exists():
-                target_tmp.unlink()
-            shutil.move(str(output_file), str(target_tmp))
-            target_tmp.replace(数据15分钟路径)
+                        t = next((item for item in batch_tasks if item["stock_code"] == code), None)
+                        df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
+                        last_d = t.get("last_date") if t else None
+                        if last_d:
+                            df = df[df["date"] >= last_d]
+                        if not df.empty:
+                            batch_frames.append(df)
+
+                        if done % 50 == 0 or done == len(tasks):
+                            log(f"  进度: {done}/{len(tasks)}")
+
+                    staged_batch_idx, stage_stats = _清洗并写入临时增量批次(staged_batch_dir, staged_batch_idx, batch_frames)
+                    新增原始行数 += int(stage_stats["raw_rows"])
+                    新增清洗后行数 += int(stage_stats["clean_rows"])
+                    清洗修复_all_zero += int(stage_stats["all_zero_bar_rows"])
+                    新增股票集合.update(stage_stats["stock_codes"])
+
+            # 对失败的股票串行重试（独立BaoStock会话，避免并发连接争用）
+            if 失败列表:
+                log(f"\n[重试] {len(失败列表)} 个失败股票串行重试（独立会话）...")
+                still_失败: list[tuple[str, str]] = []
+                retry_frames: list[pd.DataFrame] = []
+                task_map = {t["stock_code"]: t for t in tasks}
+                for code, err_orig in 失败列表:
+                    t = task_map.get(code)
+                    if t is None:
+                        still_失败.append((code, err_orig))
+                        continue
+                    retry_results = _worker_download_batch([t])
+                    r = retry_results[0] if retry_results else {"ok": False, "error": "retry returned no result"}
+                    if r.get("ok"):
+                        df = 转标准格式(r["rows"], r["fields"], r["stock_code"], r["stock_name"])
+                        last_d = t.get("last_date")
+                        if last_d:
+                            df = df[df["date"] >= last_d]
+                        if not df.empty:
+                            retry_frames.append(df)
+                        log(f"    [重试成功] {code}")
+                    else:
+                        still_失败.append((code, r.get("error", "unknown")))
+                staged_batch_idx, stage_stats = _清洗并写入临时增量批次(staged_batch_dir, staged_batch_idx, retry_frames)
+                新增原始行数 += int(stage_stats["raw_rows"])
+                新增清洗后行数 += int(stage_stats["clean_rows"])
+                清洗修复_all_zero += int(stage_stats["all_zero_bar_rows"])
+                新增股票集合.update(stage_stats["stock_codes"])
+                失败列表 = still_失败
+                if 失败列表:
+                    log(f"  重试后仍失败: {len(失败列表)}")
+                else:
+                    log("  所有失败股票重试成功")
+
+            staged_files = sorted(staged_batch_dir.glob("batch_*.parquet")) if staged_batch_dir.exists() else []
+            if not staged_files:
+                if 失败列表:
+                    log("\n[错误] 未下载到新增15分钟数据，且仍存在真实失败股票。")
+                    log(f"失败股票数: {len(失败列表)}")
+                    log("失败样本（前10）:")
+                    for code, err in 失败列表[:10]:
+                        log(f"    {code}: {err}")
+                    raise SystemExit(2)
+
+                log("\n[提示] 未下载到新增15分钟数据，但滞后股票均已判定为源端无更晚数据。")
+                return
+
+            log("\n[6/7] 清洗新增数据...")
+            log(f"  新增原始行数: {新增原始行数:,}")
+            log(f"  新增清洗后行数: {新增清洗后行数:,}")
+            log(f"  新增清洗后股票数: {len(新增股票集合):,}")
+            log(f"  清洗修复(all_zero_bar_rows): {清洗修复_all_zero:,}")
+
+            if args.dry_run:
+                log("\n[DRY-RUN] 不写回15分钟文件")
+                log(f"  失败股票数: {len(失败列表)}")
+                return
+
+            log("\n[7/7] 低内存合并并写回...")
+            _写回暂存批次到15分钟(staged_files)
         finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            shutil.rmtree(temp_download_root, ignore_errors=True)
 
         log("\n[8/8] 同步生成30分钟和60分钟...")
-        增量更新派生分钟数据(新增清洗后, logger=log)
+        for fp in staged_files:
+            增量更新派生分钟数据(pd.read_parquet(fp), logger=log)
 
         log("\n" + "=" * 70)
         log("15分钟更新完成")
-        log(f"  新增行数(清洗后): {len(新增清洗后):,}")
+        log(f"  新增行数(清洗后): {新增清洗后行数:,}")
         log(f"  失败股票数: {len(失败列表)}")
         if 失败列表:
             log("  失败样本（前10）:")

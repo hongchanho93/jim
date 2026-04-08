@@ -28,6 +28,8 @@ from 除权数据抓取 import (
 
 项目目录 = Path(__file__).resolve().parent
 默认输出目录 = 项目目录 / "数据" / "除权数据"
+全量股本变更最低覆盖率 = 0.9
+全量分红最低覆盖率 = 0.7
 
 
 def build_action_frame(merged_actions: dict[str, list]) -> pd.DataFrame:
@@ -109,6 +111,45 @@ def write_summary(path: Path, stats: FetchStats, args: argparse.Namespace, elaps
     }
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[write] {path}")
+
+
+def 校验输出结果(
+    *,
+    stats: FetchStats,
+    corporate_actions: pd.DataFrame,
+    share_changes: pd.DataFrame,
+    subset_mode: bool,
+    skip_share_changes: bool,
+) -> None:
+    if corporate_actions.empty:
+        raise ValueError("corporate_actions 输出为空")
+    if not skip_share_changes and share_changes.empty:
+        raise ValueError("share_changes 输出为空")
+
+    if subset_mode:
+        return
+
+    if stats.total_dividend_events <= 0:
+        raise ValueError("全量模式下 total_dividend_events=0，判定为异常")
+
+    if not skip_share_changes and stats.total_share_change_points <= 0:
+        raise ValueError("全量模式下 total_share_change_points=0，判定为异常")
+
+    if stats.total_codes <= 0:
+        raise ValueError("股票宇宙为空，判定为异常")
+
+    dividend_coverage = (stats.total_codes - stats.codes_without_dividends) / stats.total_codes
+    if dividend_coverage < 全量分红最低覆盖率:
+        raise ValueError(
+            f"分红覆盖率过低: {dividend_coverage:.3f} < {全量分红最低覆盖率:.3f}"
+        )
+
+    if not skip_share_changes:
+        share_change_coverage = stats.share_change_codes / stats.total_codes
+        if share_change_coverage < 全量股本变更最低覆盖率:
+            raise ValueError(
+                f"股本变更覆盖率过低: {share_change_coverage:.3f} < {全量股本变更最低覆盖率:.3f}"
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -214,9 +255,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     share_changes_path = output_dir / "share_changes.parquet"
     summary_path = output_dir / "fetch_summary.json"
 
-    build_action_frame(merged_actions).to_parquet(corporate_actions_path, index=False)
+    action_frame = build_action_frame(merged_actions)
+    share_frame = build_share_frame(share_changes)
+    校验输出结果(
+        stats=stats,
+        corporate_actions=action_frame,
+        share_changes=share_frame,
+        subset_mode=subset_mode,
+        skip_share_changes=args.skip_share_changes,
+    )
+
+    action_frame.to_parquet(corporate_actions_path, index=False)
     log(f"[write] {corporate_actions_path}")
-    build_share_frame(share_changes).to_parquet(share_changes_path, index=False)
+    share_frame.to_parquet(share_changes_path, index=False)
     log(f"[write] {share_changes_path}")
 
     elapsed = time.time() - start_time
